@@ -104,23 +104,31 @@ function renderConvPanel() {
     convList.innerHTML = '<div class="conv-empty">' + (q ? 'No matching conversations' : 'No conversations yet') + '</div>';
     return;
   }
-  var html = '';
+  convList.innerHTML = '';
   for (var i = 0; i < filtered.length; i++) {
     var s = filtered[i];
     var age = Math.floor((Date.now() / 1000 - s.created_at) / 60);
     var ageStr = age < 1 ? 'just now' : age < 60 ? age + 'm ago' : Math.floor(age / 60) + 'h ago';
     var preview = s.preview || '(empty)';
-  convList.innerHTML += '<div class="conv-card" onclick="loadConvSession(\'' + s.id + '\')">' +
-    '<div class="conv-card-preview">' + h(preview) + (s.archived ? ' [archived]' : '') + '</div>' +
-    '<div class="conv-card-meta">' +
-      '<span class="conv-card-msgs">' + s.messages + ' msgs</span>' +
-      '<span class="conv-card-time">' + ageStr + '</span>' +
-    '</div>' +
-    '<div class="conv-card-actions" style="position:absolute;top:6px;right:6px;display:flex;gap:2px;opacity:0;transition:opacity 0.15s">' +
-      '<button class="conv-card-btn" onclick="event.stopPropagation();archiveSession(\'' + s.id + '\',' + (s.archived ? 'true' : 'false') + ')" title="Archive">📦</button>' +
-      '<button class="conv-card-btn" onclick="event.stopPropagation();deleteConvSession(\'' + s.id + '\')" title="Delete">✕</button>' +
-    '</div>' +
-  '</div>';
+    convList.innerHTML += '<div class="conv-card" onclick="loadConvSession(\'' + s.id + '\')">' +
+      '<div class="conv-card-preview">' + h(preview) + (s.archived ? ' [archived]' : '') + '</div>' +
+      '<div class="conv-card-meta">' +
+        '<span class="conv-card-msgs">' + s.messages + ' msgs</span>' +
+        '<span class="conv-card-time">' + ageStr + '</span>' +
+      '</div>' +
+      '<div class="conv-card-actions" style="position:absolute;top:6px;right:6px;display:flex;gap:2px;opacity:0;transition:opacity 0.15s">' +
+        '<button class="conv-card-btn" onclick="event.stopPropagation();archiveSession(\'' + s.id + '\',' + (s.archived ? 'true' : 'false') + ')" title="Archive">\ud83d\udce6</button>' +
+        '<button class="conv-card-btn" onclick="event.stopPropagation();deleteConvSession(\'' + s.id + '\')" title="Delete">\u2715</button>' +
+      '</div>' +
+    '</div>';
+  }
+}
+
+function loadConvSession(sid) {
+  fetch('/api/sessions/load', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sid }),
   }).then(function(resp) { return resp.json(); }).then(function(data) {
     if (data.session && data.session.messages) {
       messagesEl.innerHTML = '';
