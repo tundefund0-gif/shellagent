@@ -1,4 +1,4 @@
-/* ─── ShellAgent v7.2 Frontend ─────────────────────────────────────── */
+/* ─── ShellAgent v7.3 Frontend ─────────────────────────────────────── */
 
 let chatHistory = [];
 let isStreaming = false;
@@ -161,6 +161,23 @@ function refreshSessions() {
 }
 
 // ─── Provider ─────────────────────────────────────────────────────────
+function killRunningTask() {
+  fetch('/api/kill', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId }),
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    addSystemMsg(d.killed ? 'Task cancelled.' : 'No task running.', false);
+  }).catch(function() {
+    addSystemMsg('Failed to cancel task.', true);
+  });
+  isStreaming = false;
+  sendBtn.disabled = false;
+  statusDot.className = 'status-dot';
+  iterBadge.style.display = 'none';
+  document.getElementById('killBtn').style.display = 'none';
+}
+
 function setProvider(pid) {
   if (!providerModels[pid]) return;
   currentProvider = pid;
@@ -326,6 +343,11 @@ function clearChat() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session_id: sessionId }),
   }).catch(function() {});
+}
+
+function exportChat() {
+  var url = '/api/export?session_id=' + encodeURIComponent(sessionId);
+  window.open(url, '_blank');
 }
 
 function copyChat() {
@@ -512,6 +534,7 @@ function sendMessage() {
   sendBtn.disabled = true;
   totalTokens = 0;
   statusDot.className = 'status-dot running';
+  document.getElementById('killBtn').style.display = 'flex';
   addMsg('user', text);
   chatHistory.push({ role: 'user', content: text });
   showLoading();
@@ -554,6 +577,7 @@ function sendMessage() {
         sendBtn.disabled = false;
         statusDot.className = 'status-dot';
         iterBadge.style.display = 'none';
+        document.getElementById('killBtn').style.display = 'none';
         scroll();
         userInput.focus();
         refreshSessions();
@@ -595,11 +619,13 @@ function sendMessage() {
               }
               break;
             case 'tool_call':
+              gotContent = true;
               var tc = typeof p.data === 'string' ? JSON.parse(p.data) : p.data;
               if (!agentDiv) { hideLoading(); agentDiv = addMsg('assistant', '', true); contentEl = agentDiv.querySelector('.msg-content'); }
               addToolCall(tc.id || 'tc-' + Date.now(), tc.name || '', tc.args || {});
               break;
             case 'tool_result':
+              gotContent = true;
               var tr = typeof p.data === 'string' ? JSON.parse(p.data) : p.data;
               updateToolResult(tr.id, tr.output || '', tr.success, tr.exit_code, tr.name);
               break;
@@ -639,6 +665,7 @@ function sendMessage() {
     sendBtn.disabled = false;
     statusDot.className = 'status-dot';
     iterBadge.style.display = 'none';
+    document.getElementById('killBtn').style.display = 'none';
   });
 }
 

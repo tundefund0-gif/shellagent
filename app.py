@@ -23,7 +23,7 @@ logging.basicConfig(
 log = logging.getLogger("shellagent")
 
 # ── Configuration ──────────────────────────────────────────────────────────
-VERSION = "7.2"
+VERSION = "7.3"
 PORT            = int(os.environ.get("SHELLAGENT_PORT", "8765"))
 HOST            = os.environ.get("SHELLAGENT_HOST", "0.0.0.0")
 CWD             = os.environ.get("SHELLAGENT_CWD", os.getcwd())
@@ -48,6 +48,45 @@ OLLAMA_HOST     = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_API_KEY  = os.environ.get("OLLAMA_API_KEY", "")
 DEFAULT_PROVIDER = os.environ.get("SHELLAGENT_PROVIDER", "openai")
 DEFAULT_MODEL    = os.environ.get("SHELLAGENT_MODEL", "")
+
+# --- Process tracking ---
+_running_procs = {}
+_procs_lock = threading.Lock()
+_cancelled_sessions = set()
+_cancel_lock = threading.Lock()
+
+def _cancel_session(session_id):
+    with _cancel_lock:
+        _cancelled_sessions.add(session_id)
+        _kill_process(session_id)
+
+def _is_cancelled(session_id):
+    with _cancel_lock:
+        return session_id in _cancelled_sessions
+
+def _clear_cancelled(session_id):
+    with _cancel_lock:
+        _cancelled_sessions.discard(session_id)
+
+def _track_process(session_id, proc):
+    with _procs_lock:
+        old = _running_procs.get(session_id)
+        if old:
+            try: old.kill()
+            except: pass
+        _running_procs[session_id] = proc
+
+def _untrack_process(session_id):
+    with _procs_lock:
+        _running_procs.pop(session_id, None)
+
+def _kill_process(session_id):
+    with _procs_lock:
+        p = _running_procs.pop(session_id, None)
+        if p:
+            try: p.kill(); return True
+            except: pass
+    return False
 
 # ── Rate limiter ───────────────────────────────────────────────────────────
 class RateLimiter:
@@ -565,7 +604,7 @@ def _extract_text(page):
     return re.sub(r'\n{3,}', '\n\n', re.sub(r'[ \t]+', ' ', page)).strip()
 
 # ── Tool implementations ──────────────────────────────────────────────────
-def execute_shell_command(command, working_directory=None):
+def execute_shell_command(command, working_directory=None, session_id=None):
     cwd = working_directory or CWD
     retries = 0
     last_output = ""
@@ -596,11 +635,27 @@ def execute_shell_command(command, working_directory=None):
             return {"output": safe_output, "success": True, "exit_code": 0, "retries": 0}
     for attempt in range(MAX_RETRIES):
         try:
-            r = subprocess.run(
-                command, shell=True, capture_output=True, text=True,
-                timeout=CMD_TIMEOUT, cwd=cwd,
-                env={**os.environ, "TERM": "dumb", "COLUMNS": "120"},
-            )
+            if session_id:
+                proc = subprocess.Popen(
+                    command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, cwd=cwd,
+                    env={**os.environ, "TERM": "dumb", "COLUMNS": "120"},
+                )
+                _track_process(session_id, proc)
+                try:
+                    stdout, stderr = proc.communicate(timeout=CMD_TIMEOUT)
+                    r = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    _untrack_process(session_id)
+                    return {"output": "[timeout after %ds]" % CMD_TIMEOUT, "success": False, "exit_code": -1, "retries": retries}
+                _untrack_process(session_id)
+            else:
+                r = subprocess.run(
+                    command, shell=True, capture_output=True, text=True,
+                    timeout=CMD_TIMEOUT, cwd=cwd,
+                    env={**os.environ, "TERM": "dumb", "COLUMNS": "120"},
+                )
             out = (r.stdout or "").strip()
             if r.stderr:
                 out += ("\n" if out else "") + "[stderr] %s" % r.stderr.strip()
@@ -907,7 +962,7 @@ def _analyze_directory(dpath):
 
 # ── Tool dispatch ──────────────────────────────────────────────────────────
 TOOL_DISPATCH = {
-    "execute_shell_command": lambda a: execute_shell_command(a.get("command", ""), a.get("working_directory")),
+    "execute_shell_command": lambda a: execute_shell_command(a.get("command", ""), a.get("working_directory"), a.get("session_id")),
     "web_search":            lambda a: web_search(a.get("query", "")),
     "web_fetch":             lambda a: web_fetch(a.get("url", "")),
     "read_file":             lambda a: read_file(a.get("path", "")),
@@ -1070,6 +1125,10 @@ class AgenticLoop:
         ] + list(user_messages)
 
         while self.iteration < MAX_ITERS:
+            if _is_cancelled(self.session_id):
+                self.handler._sse("done", "[Task cancelled]")
+                _clear_cancelled(self.session_id)
+                return
             self.iteration += 1
             self.handler._sse("iteration", str(self.iteration))
             try:
@@ -1148,10 +1207,15 @@ class AgenticLoop:
                     "args": args,
                 })
                 dispatcher = TOOL_DISPATCH.get(func_name)
-                result = dispatcher(args) if dispatcher else {
-                    "output": "Unknown tool: %s" % func_name,
-                    "success": False,
-                }
+                if dispatcher:
+                    if func_name == "execute_shell_command":
+                        args["session_id"] = self.session_id
+                    result = dispatcher(args)
+                else:
+                    result = {
+                        "output": "Unknown tool: %s" % func_name,
+                        "success": False,
+                    }
 
                 audit.log(self.session_id, func_name, args, result)
 
@@ -1183,6 +1247,10 @@ class AgenticLoop:
             {"role": "system", "content": sys_prompt + "\n\n--- System Context ---\n" + sys_ctx}
         ] + list(user_messages)
         while self.iteration < MAX_ITERS:
+            if _is_cancelled(self.session_id):
+                self.handler._sse("done", "[Task cancelled]")
+                _clear_cancelled(self.session_id)
+                return
             self.iteration += 1
             self.handler._sse("iteration", str(self.iteration))
             try:
@@ -1214,7 +1282,7 @@ class AgenticLoop:
                     "name": "execute_shell_command",
                     "args": {"command": cmd},
                 })
-                result = execute_shell_command(cmd)
+                result = execute_shell_command(cmd, session_id=self.session_id)
                 audit.log(self.session_id, "execute_shell_command", {"command": cmd}, result)
                 results_text += "\n\n--- Command: %s ---\n%s" % (cmd, result["output"])
                 self.handler._sse("tool_result", {
@@ -1292,6 +1360,8 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
             self._json_response({"sessions": sessions.list_sessions_with_preview()})
         elif path == "/api/audit":
             self._json_response({"entries": audit.recent(50)})
+        elif path == "/api/export":
+            self._handle_export()
         elif path.startswith("/static/"):
             self._serve_static(path[8:])
         else:
@@ -1311,6 +1381,8 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
             self._handle_delete_session()
         elif path == "/api/sessions/clear":
             self._handle_clear_session()
+        elif path == "/api/kill":
+            self._handle_kill()
         else:
             self.send_error(404)
 
@@ -1429,6 +1501,47 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
                 self._json_response({"error": "Session not found"}, 404)
         except Exception as e:
             self._json_response({"error": str(e)}, 500)
+
+    def _handle_export(self):
+        """Export session history as JSON."""
+        try:
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            session_id = params.get("session_id", [None])[0]
+            if not session_id:
+                self._json_response({"error": "Missing session_id"}, 400)
+                return
+            data = sessions.load_from_disk(session_id)
+            if not data:
+                data = sessions._sessions.get(session_id)
+            if data:
+                body = json.dumps(data, indent=2).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Disposition", "attachment; filename=session_%s.json" % session_id)
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self._json_response({"error": "Session not found"}, 404)
+        except Exception as e:
+            self._json_response({"error": str(e)}, 500)
+
+    def _handle_kill(self):
+        """Kill running process for a session."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = {}
+            if length:
+                body = json.loads(self.rfile.read(length))
+            session_id = body.get("session_id", "") if body else ""
+            if not session_id:
+                session_id = self.headers.get("X-Session-ID", "")
+            _cancel_session(session_id)
+            killed = True
+            self._json_response({"ok": True, "killed": True, "session_id": session_id})
+        except Exception as e:
+            self._json_response({"error": str(e), "killed": False}, 500)
 
     def _handle_chat(self):
         try:
