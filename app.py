@@ -23,7 +23,7 @@ logging.basicConfig(
 log = logging.getLogger("shellagent")
 
 # ── Configuration ──────────────────────────────────────────────────────────
-VERSION = "7.0"
+VERSION = "7.1"
 PORT            = int(os.environ.get("SHELLAGENT_PORT", "8765"))
 HOST            = os.environ.get("SHELLAGENT_HOST", "0.0.0.0")
 CWD             = os.environ.get("SHELLAGENT_CWD", os.getcwd())
@@ -881,7 +881,19 @@ def call_llm_stream(provider, messages, model="", tools=None):
         headers["Authorization"] = "Bearer %s" % api_key
     req = urllib.request.Request(url, data=data, headers=headers)
     timeout = 600 if provider == "ollama" else 300
-    return urllib.request.urlopen(req, timeout=timeout)
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        return resp
+    except urllib.error.HTTPError as e:
+        # Read error body for better diagnostics
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        if error_body:
+            raise Exception("API error %d: %s" % (e.code, error_body))
+        raise Exception("API error %d" % e.code)
 
 def iter_openai_stream(resp):
     for raw in resp:
@@ -893,6 +905,15 @@ def iter_openai_stream(resp):
             break
         try:
             chunk = json.loads(data)
+            # Check for API error in response
+            if "error" in chunk:
+                err = chunk["error"]
+                yield {
+                    "delta": {"content": "[API Error: %s]" % (err.get("message", str(err)))},
+                    "finish_reason": "error",
+                    "usage": None,
+                }
+                return
             choice = chunk.get("choices", [{}])[0]
             yield {
                 "delta": choice.get("delta", {}),
@@ -912,6 +933,13 @@ def iter_ollama_stream(resp):
                 continue
             try:
                 obj = json.loads(line.strip().decode("utf-8", errors="replace"))
+                if "error" in obj:
+                    yield {
+                        "delta": {"content": "[Ollama Error: %s]" % str(obj["error"])},
+                        "finish_reason": "error",
+                        "usage": None,
+                    }
+                    return
                 msg = obj.get("message", {})
                 delta = {}
                 if msg.get("content"):
@@ -1021,9 +1049,17 @@ class AgenticLoop:
             self.messages.append(assistant_msg)
 
             if not tool_calls_raw:
-                self.handler._sse("done", full_content)
+                # If first iteration returned empty/no content AND no tools, it's an error
+                if self.iteration == 1 and not full_content.strip():
+                    err_msg = "The AI returned no response. Check your API key and model."
+                    self.handler._sse("error", err_msg)
+                    sessions.add_message(self.session_id, "assistant", err_msg)
+                else:
+                    if full_content.strip():
+                        self.handler._sse("done", full_content)
+                    else:
+                        self.handler._sse("done", "[No response from AI]")
                 self.handler._sse("tokens_final", self.tokens_used)
-                sessions.add_message(self.session_id, "assistant", full_content)
                 sessions.save_to_disk(self.session_id)
                 self.handler._sse("session_saved", self.session_id)
                 return
@@ -1093,8 +1129,11 @@ class AgenticLoop:
             self.messages.append({"role": "assistant", "content": full_content})
             commands = parse_code_blocks(full_content)
             if not commands:
-                self.handler._sse("done", full_content)
-                sessions.add_message(self.session_id, "assistant", full_content)
+                if full_content.strip():
+                    self.handler._sse("done", full_content)
+                else:
+                    self.handler._sse("done", "[No response from AI]")
+                sessions.add_message(self.session_id, "assistant", full_content or "[No response from AI]")
                 sessions.save_to_disk(self.session_id)
                 return
             results_text = ""
@@ -1172,6 +1211,8 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
                 if pid == "ollama" and not models:
                     discover_ollama_models()
                     models = list(info.get("models", []))
+                # Add a special entry for custom model input
+                models = models + ["__custom__"]
                 result[pid] = {"name": info["name"], "models": models}
             self._json_response(result)
         elif path == "/api/cwd":
@@ -1193,6 +1234,8 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
             self._handle_set_cwd()
         elif path == "/api/sessions/load":
             self._handle_load_session()
+        elif path == "/api/custom_model":
+            self._handle_custom_model()
         else:
             self.send_error(404)
 
@@ -1243,6 +1286,28 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
             global CWD
             CWD = new_cwd
             self._json_response({"cwd": CWD, "ok": True})
+        except Exception as e:
+            self._json_response({"error": str(e)}, 500)
+
+    def _handle_custom_model(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 10000:
+                self._json_response({"error": "Request too large"}, 413)
+                return
+            body = json.loads(self.rfile.read(length))
+            provider = body.get("provider", "")
+            model = body.get("model", "").strip()
+            if not provider or not model:
+                self._json_response({"error": "Missing provider or model"}, 400)
+                return
+            if provider not in PROVIDERS:
+                self._json_response({"error": "Unknown provider"}, 400)
+                return
+            # Add custom model to the front of the provider's model list (in memory only)
+            if model not in PROVIDERS[provider].get("models", []):
+                PROVIDERS[provider]["models"].insert(0, model)
+            self._json_response({"ok": True, "provider": provider, "model": model})
         except Exception as e:
             self._json_response({"error": str(e)}, 500)
 
@@ -1323,10 +1388,11 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
                 self._sse("error", "Fatal: %s" % e)
             finally:
                 try:
-                    self.wfile.write(b"")
+                    self.wfile.write(b"\n")
                     self.wfile.flush()
                 except Exception:
                     pass
+                self.close_connection = True
 
         except json.JSONDecodeError:
             self._json_response({"error": "Invalid JSON"}, 400)

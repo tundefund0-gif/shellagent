@@ -1,4 +1,4 @@
-# ShellAgent v7.0
+# ShellAgent v7.1
 
 **Codex-style agentic AI shell agent with 12 tools, web search, file ops, git, grep, code analysis, planning, auto-retry, and zero dependencies.**
 

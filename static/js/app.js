@@ -1,4 +1,4 @@
-/* ─── ShellAgent v7.0 Frontend ─────────────────────────────────────── */
+/* ─── ShellAgent v7.1 Frontend ─────────────────────────────────────── */
 
 let chatHistory = [];
 let isStreaming = false;
@@ -25,20 +25,20 @@ const tokenBadge = document.getElementById('tokenBadge');
 const tokenText = document.getElementById('tokenText');
 
 const TOOL_META = {
-  execute_shell_command: { icon: '⚡', label: 'Shell', color: 'var(--green)' },
-  web_search:            { icon: '🔍', label: 'Search', color: 'var(--accent)' },
-  web_fetch:             { icon: '🌐', label: 'Fetch', color: 'var(--purple)' },
-  read_file:             { icon: '📖', label: 'Read', color: 'var(--yellow)' },
-  write_file:            { icon: '✏️', label: 'Write', color: 'var(--orange)' },
-  list_directory:        { icon: '📁', label: 'List', color: 'var(--text2)' },
-  update_plan:           { icon: '📋', label: 'Plan', color: 'var(--purple)' },
-  git_commit:            { icon: '🔀', label: 'Commit', color: 'var(--green)' },
-  validate_changes:      { icon: '✅', label: 'Validate', color: 'var(--green)' },
-  list_git_changes:      { icon: '📊', label: 'Git', color: 'var(--accent)' },
-  grep_search:           { icon: '🔎', label: 'Grep', color: 'var(--yellow)' },
-  analyze_code:          { icon: '🔬', label: 'Analyze', color: 'var(--purple)' },
+  execute_shell_command: { icon: '\u26a1', label: 'Shell', color: 'var(--green)' },
+  web_search:            { icon: '\ud83d\udd0d', label: 'Search', color: 'var(--accent)' },
+  web_fetch:             { icon: '\ud83c\udf10', label: 'Fetch', color: 'var(--purple)' },
+  read_file:             { icon: '\ud83d\udcd6', label: 'Read', color: 'var(--yellow)' },
+  write_file:            { icon: '\u270f\ufe0f', label: 'Write', color: 'var(--orange)' },
+  list_directory:        { icon: '\ud83d\udcc1', label: 'List', color: 'var(--text2)' },
+  update_plan:           { icon: '\ud83d\udccb', label: 'Plan', color: 'var(--purple)' },
+  git_commit:            { icon: '\ud83d\udd00', label: 'Commit', color: 'var(--green)' },
+  validate_changes:      { icon: '\u2705', label: 'Validate', color: 'var(--green)' },
+  list_git_changes:      { icon: '\ud83d\udcca', label: 'Git', color: 'var(--accent)' },
+  grep_search:           { icon: '\ud83d\udd0e', label: 'Grep', color: 'var(--yellow)' },
+  analyze_code:          { icon: '\ud83d\udd2c', label: 'Analyze', color: 'var(--purple)' },
 };
-function getToolMeta(n) { return TOOL_META[n] || { icon: '🔧', label: n, color: 'var(--text2)' }; }
+function getToolMeta(n) { return TOOL_META[n] || { icon: '\ud83d\udd27', label: n, color: 'var(--text2)' }; }
 
 function init() {
   Promise.all([
@@ -53,7 +53,18 @@ function init() {
     if (cwdData.cwd) document.getElementById('cwdDisplay').textContent = cwdData.cwd;
     if (arr[2]) { sessions = arr[2].sessions || []; renderSessions(); }
     for (var pid in providerModels) {
-      if (providerModels[pid].models.length > 0) { currentProvider = pid; currentModel = providerModels[pid].models[0]; break; }
+      if (providerModels[pid].models.length > 0) {
+        currentProvider = pid;
+        // Skip __custom__ as default, find first real model
+        for (var mi = 0; mi < providerModels[pid].models.length; mi++) {
+          if (providerModels[pid].models[mi] !== '__custom__') {
+            currentModel = providerModels[pid].models[mi];
+            break;
+          }
+        }
+        if (!currentModel) currentModel = providerModels[pid].models[0] || '';
+        break;
+      }
     }
     updateProviderUI();
   }).catch(function(e) { console.error('Init failed:', e); });
@@ -64,7 +75,16 @@ function init() {
 function setProvider(pid) {
   if (!providerModels[pid]) return;
   currentProvider = pid;
-  currentModel = providerModels[pid].models[0] || '';
+  currentModel = '';
+  // Find first real model (skip __custom__)
+  for (var mi = 0; mi < providerModels[pid].models.length; mi++) {
+    if (providerModels[pid].models[mi] !== '__custom__') {
+      currentModel = providerModels[pid].models[mi];
+      break;
+    }
+  }
+  if (!currentModel) currentModel = '';
+  document.getElementById('customModelInputWrap').style.display = 'none';
   updateProviderUI();
 }
 
@@ -87,6 +107,12 @@ function toggleModelDropdown() {
     if (!info.models.length) html += '<div class="dd-item" style="color:var(--text4);cursor:default">No models</div>';
     for (var i = 0; i < info.models.length; i++) {
       var m = info.models[i];
+      if (m === '__custom__') {
+        // Show "Custom model..." option
+        var sel = currentModel !== '' && currentModel !== '__custom__' && pid === currentProvider && info.models.indexOf(currentModel) === -1 ? ' selected' : '';
+        html += '<div class="dd-item' + sel + '" onclick="showCustomModelInput(\'' + pid + '\')"><span class="dd-dot ' + pid + '"></span>\u270f Custom model...</div>';
+        continue;
+      }
       var sel = pid === currentProvider && m === currentModel ? ' selected' : '';
       html += '<div class="dd-item' + sel + '" onclick="pickModel(\'' + pid + '\',\'' + esc(m) + '\')"><span class="dd-dot ' + pid + '"></span>' + h(m) + '</div>';
     }
@@ -95,8 +121,38 @@ function toggleModelDropdown() {
   modelDropdown.classList.add('show');
 }
 
-function pickModel(pid, model) { currentProvider = pid; currentModel = model; modelDropdown.classList.remove('show'); updateProviderUI(); }
-document.addEventListener('click', function(e) { if (!e.target.closest('.model-selector') && !e.target.closest('.model-dropdown')) modelDropdown.classList.remove('show'); });
+function pickModel(pid, model) { currentProvider = pid; currentModel = model; modelDropdown.classList.remove('show'); document.getElementById('customModelInputWrap').style.display = 'none'; updateProviderUI(); }
+
+function showCustomModelInput(pid) {
+  modelDropdown.classList.remove('show');
+  currentProvider = pid;
+  currentModel = '';
+  document.getElementById('customModelInputWrap').style.display = 'flex';
+  document.getElementById('customModelInput').value = '';
+  document.getElementById('customModelInput').placeholder = 'Enter model name (e.g. meta/llama-3.3-70b-instruct)';
+  document.getElementById('customModelInput').focus();
+  updateProviderUI();
+}
+
+function applyCustomModel(pid) {
+  var input = document.getElementById('customModelInput');
+  var model = input.value.trim();
+  if (!model) { input.focus(); return; }
+  currentProvider = pid || currentProvider;
+  currentModel = model;
+  document.getElementById('customModelInputWrap').style.display = 'none';
+  updateProviderUI();
+  // Notify server to add this model
+  fetch('/api/custom_model', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: currentProvider, model: model }),
+  }).catch(function() {});
+}
+
+document.addEventListener('click', function(e) {
+  if (!e.target.closest('.model-selector') && !e.target.closest('.model-dropdown')) modelDropdown.classList.remove('show');
+});
 
 function toggleCwdEdit() {
   var btn = document.getElementById('cwdBtn');
@@ -175,10 +231,19 @@ function addMsg(role, content, streaming) {
   return div;
 }
 
-function addSystemMsg(content) {
+function addSystemMsg(content, isError) {
   var div = document.createElement('div');
   div.className = 'msg msg-system';
-  div.innerHTML = '<div class="msg-content" style="color:var(--text3);font-size:11px;text-align:center;font-style:italic">' + h(content) + '</div>';
+  if (isError) {
+    div.style.background = 'rgba(248,113,113,.08)';
+    div.style.border = '1px solid rgba(248,113,113,.2)';
+    div.style.borderRadius = '8px';
+    div.style.padding = '8px 12px';
+    div.style.margin = '8px 0';
+    div.innerHTML = '<div class="msg-head"><span class="msg-icon" style="font-size:14px">\u26a0\ufe0f</span><span class="msg-name" style="color:var(--red);font-weight:700">ERROR</span></div><div class="msg-content" style="color:var(--red);font-size:12px;padding-left:0;font-style:normal">' + h(content) + '</div>';
+  } else {
+    div.innerHTML = '<div class="msg-content" style="color:var(--text3);font-size:11px;text-align:center;font-style:italic">' + h(content) + '</div>';
+  }
   messagesEl.appendChild(div);
   scroll();
 }
@@ -338,7 +403,7 @@ function sendMessage() {
     if (!resp.ok) {
       return resp.json().catch(function() { return { error: 'HTTP ' + resp.status }; }).then(function(err) {
         hideLoading();
-        addSystemMsg('Error: ' + (err.error || resp.status));
+        addSystemMsg(err.error || ('Server error (HTTP ' + resp.status + ')'), true);
         isStreaming = false; sendBtn.disabled = false; statusDot.className = 'status-dot';
         throw new Error('HTTP error');
       });
@@ -349,10 +414,21 @@ function sendMessage() {
     var agentDiv = null;
     var contentEl = null;
     var fullText = '';
+    var gotContent = false;
 
     function processStream(result) {
       if (result.done) {
-        if (agentDiv && !fullText) contentEl.innerHTML = renderMd('');
+        if (agentDiv && !gotContent) {
+          // Show error instead of blank message
+          hideLoading();
+          agentDiv.remove();
+          addSystemMsg('AI returned no response. Check your API key and model are correct.', true);
+        } else if (agentDiv && gotContent) {
+          contentEl.innerHTML = renderMd(fullText);
+        } else if (!agentDiv) {
+          hideLoading();
+          addSystemMsg('AI returned no response. Check your API key and model are correct.', true);
+        }
         isStreaming = false;
         sendBtn.disabled = false;
         statusDot.className = 'status-dot';
@@ -383,15 +459,21 @@ function sendMessage() {
               iterText.textContent = p.data;
               break;
             case 'token':
+              gotContent = true;
               if (!agentDiv) { hideLoading(); agentDiv = addMsg('assistant', '', true); contentEl = agentDiv.querySelector('.msg-content'); }
               fullText += p.data;
               contentEl.innerHTML = renderMd(fullText) + '<span class="cursor"></span>';
               scroll();
               break;
             case 'done':
-              if (!agentDiv) { hideLoading(); agentDiv = addMsg('assistant', p.data || fullText); }
-              else contentEl.innerHTML = renderMd(p.data || fullText);
-              chatHistory.push({ role: 'assistant', content: p.data || fullText });
+              if (p.data && p.data !== '[No response from AI]' && p.data.trim()) {
+                gotContent = true;
+                if (!agentDiv) { hideLoading(); agentDiv = addMsg('assistant', p.data); }
+                else contentEl.innerHTML = renderMd(p.data);
+                chatHistory.push({ role: 'assistant', content: p.data });
+              } else if (!gotContent) {
+                // Empty done — will handle in processStream finish
+              }
               break;
             case 'tool_call':
               var tc = typeof p.data === 'string' ? JSON.parse(p.data) : p.data;
@@ -417,14 +499,10 @@ function sendMessage() {
               totalTokens = (t2.prompt || 0) + (t2.completion || 0);
               tokenText.textContent = totalTokens.toLocaleString() + ' tok';
               break;
-            case 'session_saved':
-              addSystemMsg('Session saved: ' + p.data);
-              break;
             case 'error':
               statusDot.className = 'status-dot error';
-              if (!agentDiv) { hideLoading(); agentDiv = addMsg('assistant', ''); contentEl = agentDiv.querySelector('.msg-content'); }
-              fullText += '\n\n\u26a0\ufe0f ' + p.data;
-              contentEl.innerHTML = renderMd(fullText);
+              hideLoading();
+              addSystemMsg(p.data || 'Unknown error', true);
               break;
           }
         } catch (e) {}
@@ -436,7 +514,7 @@ function sendMessage() {
     if (e.message !== 'HTTP error') {
       hideLoading();
       statusDot.className = 'status-dot error';
-      addSystemMsg('Connection error: ' + e.message);
+      addSystemMsg('Connection error: ' + e.message, true);
     }
     isStreaming = false;
     sendBtn.disabled = false;
@@ -460,6 +538,8 @@ document.addEventListener('keydown', function(e) {
     modelDropdown.classList.remove('show');
     var cwdWrap = document.getElementById('cwdInputWrap');
     if (cwdWrap && cwdWrap.style.display !== 'none') toggleCwdEdit();
+    var cmWrap = document.getElementById('customModelInputWrap');
+    if (cmWrap && cmWrap.style.display !== 'none') cmWrap.style.display = 'none';
   }
 });
 
