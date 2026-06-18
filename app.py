@@ -1,26 +1,46 @@
 #!/usr/bin/env python3
 """
-ShellAgent v5.0 — Definitive Agentic AI Agent
-Codex A-to-Z: AGENTS.md, plan tracking, git commits, change validation,
-approval modes, session persistence, token tracking, preamble, self-check.
-6 tools + 4 meta-tools = 10 tools total.
+ShellAgent v7.0 — Codex-style Agentic AI Shell Agent
+
+Full Codex A-to-Z: 12 tools, AGENTS.md, skills, plan tracking,
+session persistence, token tracking, authentication, logging,
+thread safety, rate limiting, graceful shutdown, health checks,
+auto-retry, approval modes, accessibility, and comprehensive tests.
+
 Zero dependencies — Python 3.8+ stdlib only. 32/64-bit.
 """
 
 import http.server, json, os, sys, subprocess, urllib.request, urllib.error
 import urllib.parse, signal, traceback, html as html_mod, re, hashlib, time
+import threading, logging, secrets, gzip, io, textwrap, struct
+
+# ── Logging ────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("shellagent")
 
 # ── Configuration ──────────────────────────────────────────────────────────
-PORT          = int(os.environ.get("SHELLAGENT_PORT", "8765"))
-HOST          = os.environ.get("SHELLAGENT_HOST", "0.0.0.0")
-CWD           = os.environ.get("SHELLAGENT_CWD", os.getcwd())
-CMD_TIMEOUT   = int(os.environ.get("SHELLAGENT_CMD_TIMEOUT", "3600"))
-MAX_ITERS     = int(os.environ.get("SHELLAGENT_MAX_ITERS", "50"))
-APPROVAL_MODE = os.environ.get("SHELLAGENT_APPROVAL", "full-auto")  # full-auto, auto-edit, ask
-WEB_TIMEOUT   = 30
-FILE_MAX_READ = 100000
-WEB_MAX_LEN   = 8000
-SESSION_DIR   = os.environ.get("SHELLAGENT_SESSIONS", os.path.join(os.path.expanduser("~"), ".shellagent", "sessions"))
+VERSION = "7.0"
+PORT            = int(os.environ.get("SHELLAGENT_PORT", "8765"))
+HOST            = os.environ.get("SHELLAGENT_HOST", "0.0.0.0")
+CWD             = os.environ.get("SHELLAGENT_CWD", os.getcwd())
+CMD_TIMEOUT     = int(os.environ.get("SHELLAGENT_CMD_TIMEOUT", "3600"))
+MAX_ITERS       = int(os.environ.get("SHELLAGENT_MAX_ITERS", "50"))
+MAX_RETRIES     = int(os.environ.get("SHELLAGENT_MAX_RETRIES", "3"))
+APPROVAL_MODE   = os.environ.get("SHELLAGENT_APPROVAL", "full-auto")
+WEB_TIMEOUT     = 30
+FILE_MAX_READ   = 100000
+WEB_MAX_LEN     = 8000
+MAX_REQ_BODY    = 1_000_000
+MAX_CHAT_INPUT  = 50_000
+SESSION_DIR     = os.environ.get(
+    "SHELLAGENT_SESSIONS",
+    os.path.join(os.path.expanduser("~"), ".shellagent", "sessions"),
+)
+API_SECRET      = os.environ.get("SHELLAGENT_SECRET", secrets.token_hex(16))
 
 OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
 NVIDIA_API_KEY  = os.environ.get("NVIDIA_API_KEY", "")
@@ -29,10 +49,137 @@ OLLAMA_API_KEY  = os.environ.get("OLLAMA_API_KEY", "")
 DEFAULT_PROVIDER = os.environ.get("SHELLAGENT_PROVIDER", "openai")
 DEFAULT_MODEL    = os.environ.get("SHELLAGENT_MODEL", "")
 
-# ── AGENTS.md loading ─────────────────────────────────────────────────────
+# ── Rate limiter ───────────────────────────────────────────────────────────
+class RateLimiter:
+    def __init__(self, max_per_minute=30):
+        self.max_per_minute = max_per_minute
+        self._hits = {}
+        self._lock = threading.Lock()
 
+    def allow(self, key="default"):
+        now = time.time()
+        with self._lock:
+            if key not in self._hits:
+                self._hits[key] = []
+            self._hits[key] = [t for t in self._hits[key] if now - t < 60]
+            if len(self._hits[key]) >= self.max_per_minute:
+                return False
+            self._hits[key].append(now)
+            return True
+
+rate_limiter = RateLimiter(max_per_minute=60)
+
+# ── Thread-safe session store ──────────────────────────────────────────────
+class SessionStore:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sessions = {}
+
+    def get_or_create(self, session_id=None):
+        if not session_id:
+            session_id = secrets.token_hex(8)
+        with self._lock:
+            if session_id not in self._sessions:
+                self._sessions[session_id] = {
+                    "id": session_id,
+                    "messages": [],
+                    "plan": [],
+                    "created_at": time.time(),
+                }
+            return self._sessions[session_id]
+
+    def add_message(self, session_id, role, content):
+        with self._lock:
+            if session_id in self._sessions:
+                self._sessions[session_id]["messages"].append({
+                    "role": role,
+                    "content": content,
+                    "timestamp": time.time(),
+                })
+
+    def get_messages(self, session_id):
+        with self._lock:
+            s = self._sessions.get(session_id)
+            return list(s["messages"]) if s else []
+
+    def set_plan(self, session_id, plan):
+        with self._lock:
+            if session_id in self._sessions:
+                self._sessions[session_id]["plan"] = plan
+
+    def list_sessions(self):
+        with self._lock:
+            return [{
+                "id": s["id"],
+                "messages": len(s["messages"]),
+                "created_at": s["created_at"],
+            } for s in sorted(
+                self._sessions.values(),
+                key=lambda x: x["created_at"],
+                reverse=True,
+            )[:50]]
+
+    def save_to_disk(self, session_id):
+        try:
+            os.makedirs(SESSION_DIR, exist_ok=True)
+            with self._lock:
+                s = self._sessions.get(session_id)
+                if not s:
+                    return False
+                data = dict(s)
+            fpath = os.path.join(SESSION_DIR, f"{session_id}.json")
+            with open(fpath, "w") as f:
+                json.dump(data, f)
+            return True
+        except Exception as e:
+            log.error("Session save failed: %s", e)
+            return False
+
+    def load_from_disk(self, session_id):
+        try:
+            fpath = os.path.join(SESSION_DIR, f"{session_id}.json")
+            with open(fpath, "r") as f:
+                data = json.load(f)
+            with self._lock:
+                self._sessions[session_id] = data
+            return data
+        except Exception:
+            return None
+
+sessions = SessionStore()
+
+# ── Audit log ──────────────────────────────────────────────────────────────
+class AuditLog:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries = []
+
+    def log(self, session_id, tool, args, result):
+        entry = {
+            "session": session_id,
+            "tool": tool,
+            "args_summary": str(args)[:200],
+            "success": result.get("success", False),
+            "exit_code": result.get("exit_code"),
+            "retries": result.get("retries", 0),
+            "timestamp": time.time(),
+        }
+        with self._lock:
+            self._entries.append(entry)
+            if len(self._entries) > 1000:
+                self._entries = self._entries[-500:]
+        log.info("[%s] %s: success=%s exit=%s retries=%s",
+                 session_id, tool, entry["success"],
+                 entry.get("exit_code"), entry.get("retries"))
+
+    def recent(self, n=20):
+        with self._lock:
+            return list(self._entries[-n:])
+
+audit = AuditLog()
+
+# ── AGENTS.md loading ─────────────────────────────────────────────────────
 def load_agents_md():
-    """Search CWD and parents for AGENTS.md files, return combined content."""
     contents = []
     d = CWD
     for _ in range(10):
@@ -40,7 +187,7 @@ def load_agents_md():
         if os.path.isfile(fpath):
             try:
                 with open(fpath, "r", errors="replace") as f:
-                    contents.insert(0, f"[from {fpath}]\n{f.read()[:4000]}")
+                    contents.insert(0, "[from %s]\n%s" % (fpath, f.read()[:4000]))
             except Exception:
                 pass
         parent = os.path.dirname(d)
@@ -49,244 +196,315 @@ def load_agents_md():
         d = parent
     return "\n\n".join(contents)
 
-# ── All 10 tools ──────────────────────────────────────────────────────────
+# ── Skills loading ─────────────────────────────────────────────────────────
+def load_skills():
+    skills = []
+    skill_dirs = [
+        os.path.join(CWD, ".shellagent", "skills"),
+        os.path.join(os.path.expanduser("~"), ".shellagent", "skills"),
+    ]
+    for sdir in skill_dirs:
+        if not os.path.isdir(sdir):
+            continue
+        for name in sorted(os.listdir(sdir)):
+            fpath = os.path.join(sdir, name)
+            if os.path.isfile(fpath) and name.endswith((".md", ".txt")):
+                try:
+                    with open(fpath, "r", errors="replace") as f:
+                        skills.append("[skill: %s]\n%s" % (name, f.read()[:2000]))
+                except Exception:
+                    pass
+    return "\n\n".join(skills)
 
+# ── All 12 tools ──────────────────────────────────────────────────────────
 ALL_TOOLS = [
-    {"type": "function", "function": {"name": "execute_shell_command", "description": "Execute a shell command. Returns stdout, stderr, exit code.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "Shell command to execute"}, "working_directory": {"type": "string", "description": "Optional working directory"}}, "required": ["command"]}}},
-    {"type": "function", "function": {"name": "web_search", "description": "Search the web via DuckDuckGo. Returns titles, URLs, snippets.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}}, "required": ["query"]}}},
-    {"type": "function", "function": {"name": "web_fetch", "description": "Fetch a URL and return its text content.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "URL to fetch"}}, "required": ["url"]}}},
-    {"type": "function", "function": {"name": "read_file", "description": "Read a file from disk.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "File path"}}, "required": ["path"]}}},
-    {"type": "function", "function": {"name": "write_file", "description": "Write content to a file. Creates dirs if needed.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "File path"}, "content": {"type": "string", "description": "Content to write"}}, "required": ["path", "content"]}}},
-    {"type": "function", "function": {"name": "list_directory", "description": "List files and subdirectories.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Directory path"}}, "required": []}}},
-    {"type": "function", "function": {"name": "update_plan", "description": "Create or update the task plan with steps and status (pending/in_progress/completed). Use at start of complex tasks.", "parameters": {"type": "object", "properties": {"plan": {"type": "array", "items": {"type": "object", "properties": {"step": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["step", "status"]}, "description": "The full plan"}, "explanation": {"type": "string", "description": "Optional explanation for plan changes"}}, "required": ["plan"]}}},
-    {"type": "function", "function": {"name": "git_commit", "description": "Stage all changes and create a git commit with a descriptive message.", "parameters": {"type": "object", "properties": {"message": {"type": "string", "description": "Commit message"}, "files": {"type": "string", "description": "Specific files to stage (default: all)"}, "branch": {"type": "string", "description": "Optional branch name to commit to"}}, "required": ["message"]}}},
-    {"type": "function", "function": {"name": "validate_changes", "description": "Run validation on recent changes: tests, lint, build, or a custom command.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "Validation command to run (e.g. 'npm test', 'python -m pytest')"}, "description": {"type": "string", "description": "What this validation checks"}}, "required": ["command"]}}},
-    {"type": "function", "function": {"name": "list_git_changes", "description": "Show git status, recent commits, or diff of working tree.", "parameters": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["status", "log", "diff"], "description": "What to show (default: status)"}, "args": {"type": "string", "description": "Extra args like '--staged', '-5', 'HEAD~3'"}}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "execute_shell_command",
+        "description": "Execute a shell command. Returns stdout, stderr, exit code. Use for running programs, installing packages, compiling code, etc.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string", "description": "Shell command to execute"},
+            "working_directory": {"type": "string", "description": "Optional working directory (defaults to CWD)"},
+        }, "required": ["command"]},
+    }},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the web via DuckDuckGo. Returns titles, URLs, snippets for up to 8 results.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Search query"},
+        }, "required": ["query"]},
+    }},
+    {"type": "function", "function": {
+        "name": "web_fetch",
+        "description": "Fetch a URL and return its text content (HTML parsed to text).",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "URL to fetch"},
+        }, "required": ["url"]},
+    }},
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read a file from disk. Returns content with line numbers.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "File path to read"},
+        }, "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "Write content to a file. Creates parent directories if needed.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "File path to write"},
+            "content": {"type": "string", "description": "Content to write to the file"},
+        }, "required": ["path", "content"]},
+    }},
+    {"type": "function", "function": {
+        "name": "list_directory",
+        "description": "List files and subdirectories in a directory.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Directory path (defaults to CWD)"},
+        }, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "update_plan",
+        "description": "Update the task plan. Each step has a description and status (pending/in_progress/completed).",
+        "parameters": {"type": "object", "properties": {
+            "plan": {"type": "array", "items": {"type": "object", "properties": {
+                "step": {"type": "string"},
+                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+            }, "required": ["step", "status"]}},
+            "explanation": {"type": "string", "description": "Optional explanation for the plan update"},
+        }, "required": ["plan"]},
+    }},
+    {"type": "function", "function": {
+        "name": "git_commit",
+        "description": "Stage and commit changes to git.",
+        "parameters": {"type": "object", "properties": {
+            "message": {"type": "string", "description": "Commit message"},
+            "files": {"type": "array", "items": {"type": "string"}, "description": "Files to stage (empty for all)"},
+            "branch": {"type": "string", "description": "Branch name (optional)"},
+        }, "required": ["message"]},
+    }},
+    {"type": "function", "function": {
+        "name": "validate_changes",
+        "description": "Run tests, lint, or build commands to validate changes.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string", "description": "Validation command to run"},
+            "description": {"type": "string", "description": "What this validates"},
+        }, "required": ["command"]},
+    }},
+    {"type": "function", "function": {
+        "name": "list_git_changes",
+        "description": "View git status, log, diff, or branch info.",
+        "parameters": {"type": "object", "properties": {
+            "mode": {"type": "string", "enum": ["status", "log", "diff", "branch"], "description": "What to show"},
+            "args": {"type": "string", "description": "Additional arguments"},
+        }, "required": ["mode"]},
+    }},
+    {"type": "function", "function": {
+        "name": "grep_search",
+        "description": "Search for text patterns in files using grep/ripgrep. Returns matching lines with file paths and line numbers.",
+        "parameters": {"type": "object", "properties": {
+            "pattern": {"type": "string", "description": "Search pattern (regex supported)"},
+            "path": {"type": "string", "description": "Directory or file to search in"},
+            "include": {"type": "string", "description": "File glob pattern to filter (e.g. '*.py')"},
+            "case_insensitive": {"type": "boolean", "description": "Case-insensitive search"},
+        }, "required": ["pattern"]},
+    }},
+    {"type": "function", "function": {
+        "name": "analyze_code",
+        "description": "Analyze code structure: count lines, find functions/classes, identify imports and patterns.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "File or directory to analyze"},
+        }, "required": ["path"]},
+    }},
 ]
 
-# ── System prompt (Codex-style outcome-first, preamble, self-check) ────
-
+# ── System prompt ──────────────────────────────────────────────────────────
 def build_system_prompt():
     agents_md = load_agents_md()
-    base = """You are ShellAgent, an autonomous AI coding agent. You have 10 tools and full access to the user's machine.
+    skills = load_skills()
+    base = textwrap.dedent("""\
+        You are ShellAgent v{version}, an autonomous AI coding agent built as a lightweight alternative to Codex CLI. You have 12 tools and full access to the user's machine.
 
-## Personality
-You are capable, direct, and task-oriented. Prefer making progress over stopping for clarification when the request is clear enough to attempt. Stay concise. When an error occurs, acknowledge it plainly and focus on fixing it.
+        ## Core Identity
+        You are capable, direct, and task-oriented. You run on the user's machine and can execute shell commands, read/write files, search the web, manage git, and more. You prefer making progress over stopping for clarification when the request is clear.
 
-## Tools (10 total)
-**Execution:** execute_shell_command, validate_changes
-**Web:** web_search, web_fetch
-**Files:** read_file, write_file, list_directory
-**Planning:** update_plan
-**Git:** git_commit, list_git_changes
+        ## Tools (12 total)
+        **Execution:** execute_shell_command (with auto-retry on failure), validate_changes
+        **Web:** web_search (DuckDuckGo), web_fetch (URL content)
+        **Files:** read_file (with line numbers), write_file (auto-creates dirs), list_directory
+        **Search:** grep_search (regex file search), analyze_code (code structure analysis)
+        **Planning:** update_plan (track steps with status)
+        **Git:** git_commit (stage + commit), list_git_changes (status/log/diff/branch)
 
-## How you work
-1. For multi-step tasks, call update_plan first to outline the steps
-2. Always start with a short preamble (1-2 sentences) before heavy tool use
-3. Execute tools, review output carefully
-4. If something fails, diagnose and retry with a different approach
-5. Run validate_changes after code modifications
-6. Commit meaningful progress with git_commit
-7. Summarize what was done
+        ## How you work (Codex-style)
+        1. For multi-step tasks, call update_plan first to outline your approach
+        2. Always start with a brief preamble (1-2 sentences) before heavy tool use
+        3. Execute tools, review output carefully
+        4. If something fails, diagnose and retry — you have up to 3 retries per tool
+        5. After code changes, run validate_changes
+        6. Commit meaningful progress with git_commit
+        7. End with a clear summary of what was done
 
-## Rules
-- Execute everything immediately — no confirmation needed in full-auto mode
-- Read files before modifying them
-- Use any combination of tools freely
-- If a command fails, ALWAYS try to fix and retry
-- After making code changes, validate them
-- Keep plans up to date as you work
-- For complex tasks, break into smaller steps
+        ## Approval Mode
+        Approval mode is: {approval}
+        - full-auto: Execute everything immediately, no confirmation needed
+        - auto-edit: Execute shell commands freely, confirm file writes
+        - ask: Ask before any destructive action
 
-## Self-check
-Before your final answer, verify:
-- Did all commands succeed?
-- Did you check the output?
-- Is there anything you missed?
-- Should you run a validation?
+        ## Critical Rules
+        - Execute everything immediately — no confirmation in full-auto mode
+        - Read files before modifying them
+        - If a command fails, ALWAYS diagnose the error and retry with a fix
+        - After making code changes, validate them
+        - Keep plans up to date as you work
+        - Use grep_search to find code patterns before modifying
+        - Use analyze_code to understand unfamiliar codebases
 
-## Preamble
-When starting a multi-step task, begin with a brief visible update:
-"I'll [what you're doing]. Let me start by [first step]."
+        ## Preamble Style
+        Before starting work, give a brief visible update:
+        "I'll [what you're doing]. Let me [first step]."
+        This keeps the user informed during long tasks.
 
-## Error recovery
-1. Read the error message carefully
-2. Check if a package needs installing, path is wrong, or permissions are needed
-3. Try the fixed command
-4. If still failing after 3 attempts, explain what went wrong"""
+        ## Self-check (before finishing)
+        - Did all commands succeed?
+        - Did you check the output of each tool?
+        - Is there anything you missed?
+        - Should you run a validation?
+        - Is the commit message accurate?
 
+        ## Error Recovery Protocol
+        1. Read the error message carefully
+        2. Check if a package needs installing, path is wrong, or permissions are needed
+        3. Try the fixed command
+        4. If still failing after 3 attempts, explain what went wrong and suggest alternatives
+
+        ## Web Research
+        When asked to research something:
+        1. Use web_search to find relevant results
+        2. Use web_fetch to read the most promising pages
+        3. Synthesize the information into a clear answer
+        4. Cite URLs when relevant""").format(version=VERSION, approval=APPROVAL_MODE)
     if agents_md:
-        base += f"\n\n## Project Instructions (from AGENTS.md)\n\n{agents_md}"
-
+        base += "\n\n## Project Instructions (from AGENTS.md)\n\n" + agents_md
+    if skills:
+        base += "\n\n## Loaded Skills\n\n" + skills
     return base
 
 # ── Provider definitions ───────────────────────────────────────────────────
-
 PROVIDERS = {
-    "openai": {"name": "OpenAI", "url": "https://api.openai.com/v1/chat/completions", "env_key": "OPENAI_API_KEY", "models": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o3", "o3-mini", "o4-mini"], "supports_tools": True, "needs_key": True},
-    "nvidia": {"name": "NVIDIA NIM", "url": "https://integrate.api.nvidia.com/v1/chat/completions", "env_key": "NVIDIA_API_KEY", "models": ["meta/llama-3.3-70b-instruct", "meta/llama-3.1-8b-instruct", "meta/llama-3.1-70b-instruct", "nvidia/llama-3.3-nemotron-super-49b-v1", "nvidia/llama-3.1-nemotron-ultra-253b-v1", "mistralai/mistral-large-2-instruct", "mistralai/codestral-2405", "google/gemma-2-27b-it", "deepseek-ai/deepseek-r1"], "supports_tools": True, "needs_key": True},
-    "ollama": {"name": "Ollama", "url": None, "env_key": "OLLAMA_API_KEY", "models": [], "supports_tools": True, "needs_key": False},
+    "openai": {
+        "name": "OpenAI",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "env_key": "OPENAI_API_KEY",
+        "models": [
+            "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini",
+            "gpt-4.1-nano", "o3", "o3-mini", "o4-mini",
+        ],
+        "supports_tools": True,
+        "needs_key": True,
+    },
+    "nvidia": {
+        "name": "NVIDIA NIM",
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "env_key": "NVIDIA_API_KEY",
+        "models": [
+            "meta/llama-3.3-70b-instruct",
+            "meta/llama-3.1-8b-instruct",
+            "meta/llama-3.1-70b-instruct",
+            "nvidia/llama-3.3-nemotron-super-49b-v1",
+            "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+            "mistralai/mistral-large-2-instruct",
+            "mistralai/codestral-2405",
+            "google/gemma-2-27b-it",
+            "deepseek-ai/deepseek-r1",
+        ],
+        "supports_tools": True,
+        "needs_key": True,
+    },
+    "ollama": {
+        "name": "Ollama",
+        "url": None,
+        "env_key": "OLLAMA_API_KEY",
+        "models": [],
+        "supports_tools": True,
+        "needs_key": False,
+    },
 }
 
 # ── Helpers ────────────────────────────────────────────────────────────────
-
 def get_system_context():
-    ctx = f"Working directory: {CWD}\nOS: {sys.platform}\nPython: {sys.version}\nApproval mode: {APPROVAL_MODE}\n"
-    for cmd_args, parser in [("uname", lambda t: f"System: {t.strip()}"), ("df -h /", _parse_df), ("free -h", _parse_free)]:
+    ctx = "Working directory: %s\nOS: %s\nPython: %s\nApproval mode: %s\n" % (
+        CWD, sys.platform, sys.version, APPROVAL_MODE,
+    )
+    for cmd_args, parser in [
+        ("uname", lambda t: "System: %s" % t.strip()),
+        ("df -h /", _parse_df),
+        ("free -h", _parse_free),
+    ]:
         try:
             parts = cmd_args.split()
             r = subprocess.run(parts, capture_output=True, text=True, timeout=5)
-            if r.returncode == 0: ctx += parser(r.stdout) + "\n"
-        except Exception: pass
-    # Git info
+            if r.returncode == 0:
+                ctx += parser(r.stdout) + "\n"
+        except Exception:
+            pass
     try:
-        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=3, cwd=CWD)
-        if r.returncode == 0: ctx += f"Git commit: {r.stdout.strip()}\n"
-        r2 = subprocess.run(["git", "branch", "--show-current"], capture_output=True, text=True, timeout=3, cwd=CWD)
-        if r2.returncode == 0: ctx += f"Git branch: {r2.stdout.strip()}\n"
-    except Exception: pass
+        r = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=3, cwd=CWD,
+        )
+        if r.returncode == 0:
+            ctx += "Git commit: %s\n" % r.stdout.strip()
+        r2 = subprocess.run(
+            ["git", "branch", "--show-current"],
+            capture_output=True, text=True, timeout=3, cwd=CWD,
+        )
+        if r2.returncode == 0:
+            ctx += "Git branch: %s\n" % r2.stdout.strip()
+    except Exception:
+        pass
     return ctx
 
 def _parse_df(t):
     lines = t.strip().split("\n")
     if len(lines) > 1:
         p = lines[1].split()
-        if len(p) >= 5: return f"Disk: {p[2]} used / {p[1]} total ({p[4]})"
+        if len(p) >= 5:
+            return "Disk: %s used / %s total (%s)" % (p[2], p[1], p[4])
     return ""
 
 def _parse_free(t):
     lines = t.strip().split("\n")
     if len(lines) > 1:
         p = lines[1].split()
-        if len(p) >= 3: return f"Memory: {p[2]} used / {p[1]} total"
+        if len(p) >= 3:
+            return "Memory: %s used / %s total" % (p[2], p[1])
     return ""
 
 def get_api_key(provider):
     return os.environ.get(PROVIDERS.get(provider, {}).get("env_key", ""), "")
 
 def get_model(provider, model_override=""):
-    if model_override: return model_override
-    if DEFAULT_MODEL and provider == DEFAULT_PROVIDER: return DEFAULT_MODEL
+    if model_override:
+        return model_override
+    if DEFAULT_MODEL and provider == DEFAULT_PROVIDER:
+        return DEFAULT_MODEL
     models = PROVIDERS.get(provider, {}).get("models", [])
     return models[0] if models else ""
 
 def get_provider_url(provider):
-    if provider == "ollama": return f"{OLLAMA_HOST.rstrip('/')}/v1/chat/completions"
+    if provider == "ollama":
+        return "%s/v1/chat/completions" % OLLAMA_HOST.rstrip("/")
     return PROVIDERS.get(provider, {}).get("url", "")
-
-# ── Tool implementations ──────────────────────────────────────────────────
-
-def execute_shell_command(command, working_directory=None):
-    cwd = working_directory or CWD
-    try:
-        r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=CMD_TIMEOUT, cwd=cwd, env={**os.environ, "TERM": "dumb", "COLUMNS": "120"})
-        out = (r.stdout or "").strip()
-        if r.stderr: out += ("\n" if out else "") + f"[stderr] {r.stderr.strip()}"
-        out += f"\n[exit code: {r.returncode}]"
-        return {"output": out.strip() or "[no output]", "success": r.returncode == 0, "exit_code": r.returncode}
-    except subprocess.TimeoutExpired:
-        return {"output": f"[timeout after {CMD_TIMEOUT}s]", "success": False, "exit_code": -1}
-    except Exception as e:
-        return {"output": f"[error: {e}]", "success": False, "exit_code": -1}
-
-def web_search(query):
-    try:
-        encoded = urllib.parse.quote_plus(query)
-        req = urllib.request.Request(f"https://html.duckduckgo.com/html/?q={encoded}", headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"})
-        page = urllib.request.urlopen(req, timeout=WEB_TIMEOUT).read().decode("utf-8", errors="replace")
-        results = []
-        for m in re.finditer(r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</(?:td|span|div)', page, re.DOTALL):
-            href, title, snippet = m.group(1), _strip_html(m.group(2)), _strip_html(m.group(3))
-            if "uddg=" in href:
-                m2 = re.search(r'uddg=([^&]+)', href)
-                if m2: href = urllib.parse.unquote(m2.group(1))
-            if title.strip(): results.append({"title": title.strip(), "url": href.strip(), "snippet": snippet.strip()})
-            if len(results) >= 8: break
-        if not results: return {"output": f"No results for: {query}", "success": True}
-        output = f"Search results for: {query}\n\n"
-        for i, r in enumerate(results, 1): output += f"{i}. {r['title']}\n   URL: {r['url']}\n   {r['snippet']}\n\n"
-        return {"output": output.strip(), "success": True}
-    except Exception as e:
-        return {"output": f"Search error: {e}", "success": False}
-
-def web_fetch(url):
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"})
-        raw = urllib.request.urlopen(req, timeout=WEB_TIMEOUT).read()
-        try: import gzip; raw = gzip.decompress(raw)
-        except: pass
-        text = _extract_text(raw.decode("utf-8", errors="replace"))
-        if len(text) > WEB_MAX_LEN: text = text[:WEB_MAX_LEN] + f"\n\n[truncated — {len(text)} chars total]"
-        return {"output": f"Content of {url}:\n\n{text}", "success": True}
-    except Exception as e:
-        return {"output": f"Fetch error ({url}): {e}", "success": False}
-
-def read_file(path):
-    try:
-        fpath = os.path.expanduser(path)
-        if not os.path.isabs(fpath): fpath = os.path.join(CWD, fpath)
-        if not os.path.exists(fpath): return {"output": f"Not found: {path}", "success": False}
-        with open(fpath, "r", errors="replace") as f: content = f.read(FILE_MAX_READ)
-        sz = os.path.getsize(fpath)
-        if sz > FILE_MAX_READ: content += f"\n\n[truncated — {sz} bytes total]"
-        return {"output": content or "[empty file]", "success": True}
-    except Exception as e:
-        return {"output": f"Read error: {e}", "success": False}
-
-def write_file(path, content):
-    try:
-        fpath = os.path.expanduser(path)
-        if not os.path.isabs(fpath): fpath = os.path.join(CWD, fpath)
-        os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
-        with open(fpath, "w") as f: f.write(content)
-        return {"output": f"Written {len(content)} bytes to {fpath}", "success": True}
-    except Exception as e:
-        return {"output": f"Write error: {e}", "success": False}
-
-def list_directory(path="."):
-    try:
-        dpath = os.path.expanduser(path)
-        if not os.path.isabs(dpath): dpath = os.path.join(CWD, dpath)
-        if not os.path.isdir(dpath): return {"output": f"Not a directory: {path}", "success": False}
-        entries = []
-        for name in sorted(os.listdir(dpath)):
-            full = os.path.join(dpath, name)
-            is_dir = os.path.isdir(full)
-            try: size = os.path.getsize(full) if not is_dir else 0
-            except: size = 0
-            entries.append(f"{'d' if is_dir else 'f'} {name}{'/' if is_dir else ''}  {_fmt_size(size) if not is_dir else ''}")
-        return {"output": f"Contents of {dpath} ({len(entries)} items):\n\n" + "\n".join(entries), "success": True}
-    except Exception as e:
-        return {"output": f"List error: {e}", "success": False}
-
-def update_plan(plan, explanation=""):
-    return {"output": f"Plan updated with {len(plan)} steps.\n" + (f"Explanation: {explanation}\n" if explanation else "") + "\n".join(f"  [{s['status']}] {s['step']}" for s in plan), "success": True, "plan": plan}
-
-def git_commit(message, files=".", branch=""):
-    try:
-        if files and files != ".": execute_shell_command(f"git add {files}")
-        else: execute_shell_command("git add -A")
-        cmd = f"git commit --author=\"ShellAgent <shellagent@local>\" -m \"{message}\""
-        if branch: cmd = f"git checkout {branch} && git add -A && git commit --author=\"ShellAgent <shellagent@local>\" -m \"{message}\""
-        return execute_shell_command(cmd)
-    except Exception as e:
-        return {"output": f"Git error: {e}", "success": False, "exit_code": -1}
-
-def validate_changes(command, description=""):
-    result = execute_shell_command(command)
-    prefix = f"Validation: {description}\n" if description else ""
-    return {"output": prefix + result["output"], "success": result["success"], "exit_code": result.get("exit_code")}
-
-def list_git_changes(mode="status", args=""):
-    cmd = f"git {mode} {args}".strip()
-    return execute_shell_command(cmd)
 
 def _strip_html(text):
     return re.sub(r'\s+', ' ', html_mod.unescape(re.sub(r'<[^>]+>', '', text))).strip()
 
 def _extract_text(page):
     for tag in ['script', 'style', 'nav', 'footer', 'header']:
-        page = re.sub(f'<{tag}[^>]*>.*?</{tag}>', '', page, flags=re.DOTALL | re.IGNORECASE)
+        page = re.sub(
+            r'<%s[^>]*>.*?</%s>' % (tag, tag),
+            '', page, flags=re.DOTALL | re.IGNORECASE,
+        )
     page = re.sub(r'<br\s*/?>', '\n', page, flags=re.IGNORECASE)
     page = re.sub(r'<p[^>]*>', '\n\n', page, flags=re.IGNORECASE)
     page = re.sub(r'<h[1-6][^>]*>', '\n\n## ', page, flags=re.IGNORECASE)
@@ -300,29 +518,355 @@ def _extract_text(page):
     page = html_mod.unescape(page)
     return re.sub(r'\n{3,}', '\n\n', re.sub(r'[ \t]+', ' ', page)).strip()
 
-def _fmt_size(n):
-    for u in ["B", "KB", "MB", "GB"]:
-        if n < 1024: return f"{n:.0f}{u}" if u == "B" else f"{n:.1f}{u}"
-        n /= 1024
-    return f"{n:.1f}TB"
+# ── Tool implementations ──────────────────────────────────────────────────
+def execute_shell_command(command, working_directory=None):
+    cwd = working_directory or CWD
+    retries = 0
+    last_output = ""
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = subprocess.run(
+                command, shell=True, capture_output=True, text=True,
+                timeout=CMD_TIMEOUT, cwd=cwd,
+                env={**os.environ, "TERM": "dumb", "COLUMNS": "120"},
+            )
+            out = (r.stdout or "").strip()
+            if r.stderr:
+                out += ("\n" if out else "") + "[stderr] %s" % r.stderr.strip()
+            out += "\n[exit code: %d]" % r.returncode
+            if r.returncode == 0:
+                return {"output": out.strip() or "[no output]", "success": True, "exit_code": 0, "retries": retries}
+            last_output = out.strip() or "[no output]"
+            retries += 1
+            if retries < MAX_RETRIES:
+                log.info("Command failed (exit %d), retry %d/%d: %s",
+                         r.returncode, retries, MAX_RETRIES, command[:100])
+                time.sleep(0.5 * retries)
+                continue
+            return {"output": last_output, "success": False, "exit_code": r.returncode, "retries": retries}
+        except subprocess.TimeoutExpired:
+            return {"output": "[timeout after %ds]" % CMD_TIMEOUT, "success": False, "exit_code": -1, "retries": retries}
+        except Exception as e:
+            last_output = "[error: %s]" % e
+            retries += 1
+            if retries >= MAX_RETRIES:
+                return {"output": last_output, "success": False, "exit_code": -1, "retries": retries}
+            time.sleep(0.5 * retries)
+    return {"output": last_output or "[exhausted retries]", "success": False, "exit_code": -1, "retries": retries}
 
-# ── Tool dispatcher ────────────────────────────────────────────────────────
+def web_search(query):
+    try:
+        encoded = urllib.parse.quote_plus(query)
+        req = urllib.request.Request(
+            "https://html.duckduckgo.com/html/?q=%s" % encoded,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"},
+        )
+        page = urllib.request.urlopen(req, timeout=WEB_TIMEOUT).read().decode("utf-8", errors="replace")
+        results = []
+        for m in re.finditer(
+            r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</(?:td|span|div)',
+            page, re.DOTALL,
+        ):
+            href, title, snippet = m.group(1), _strip_html(m.group(2)), _strip_html(m.group(3))
+            if "uddg=" in href:
+                m2 = re.search(r'uddg=([^&]+)', href)
+                if m2:
+                    href = urllib.parse.unquote(m2.group(1))
+            if title.strip():
+                results.append({"title": title.strip(), "url": href.strip(), "snippet": snippet.strip()})
+            if len(results) >= 8:
+                break
+        if not results:
+            return {"output": "No results for: %s" % query, "success": True}
+        output = "Search results for: %s\n\n" % query
+        for i, r in enumerate(results, 1):
+            output += "%d. %s\n   URL: %s\n   %s\n\n" % (i, r["title"], r["url"], r["snippet"])
+        return {"output": output.strip(), "success": True}
+    except Exception as e:
+        return {"output": "Search error: %s" % e, "success": False}
 
+def web_fetch(url):
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"},
+        )
+        raw = urllib.request.urlopen(req, timeout=WEB_TIMEOUT).read()
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            pass
+        text = _extract_text(raw.decode("utf-8", errors="replace"))
+        if len(text) > WEB_MAX_LEN:
+            text = text[:WEB_MAX_LEN] + "\n\n[truncated — %d chars total]" % len(text)
+        return {"output": "Content of %s:\n\n%s" % (url, text), "success": True}
+    except Exception as e:
+        return {"output": "Fetch error: %s" % e, "success": False}
+
+def read_file(path):
+    try:
+        fpath = os.path.expanduser(path)
+        if not os.path.isfile(fpath):
+            return {"output": "File not found: %s" % path, "success": False}
+        size = os.path.getsize(fpath)
+        if size > FILE_MAX_READ:
+            return {"output": "File too large: %d bytes (max %d)" % (size, FILE_MAX_READ), "success": False}
+        with open(fpath, "r", errors="replace") as f:
+            lines = f.readlines()
+        numbered = ["%4d | %s" % (i + 1, l.rstrip()) for i, l in enumerate(lines)]
+        return {"output": "\n".join(numbered), "success": True}
+    except Exception as e:
+        return {"output": "Read error: %s" % e, "success": False}
+
+def write_file(path, content):
+    try:
+        fpath = os.path.expanduser(path)
+        os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
+        with open(fpath, "w") as f:
+            f.write(content)
+        return {"output": "Written %d bytes to %s" % (len(content), path), "success": True}
+    except Exception as e:
+        return {"output": "Write error: %s" % e, "success": False}
+
+def list_directory(path=None):
+    try:
+        dpath = path or CWD
+        dpath = os.path.expanduser(dpath)
+        if not os.path.isdir(dpath):
+            return {"output": "Not a directory: %s" % dpath, "success": False}
+        entries = sorted(os.listdir(dpath))
+        lines = []
+        for e in entries:
+            full = os.path.join(dpath, e)
+            if os.path.isdir(full):
+                lines.append("  [dir]  %s/" % e)
+            else:
+                sz = os.path.getsize(full)
+                if sz < 1024:
+                    sz_str = "%dB" % sz
+                elif sz < 1048576:
+                    sz_str = "%dKB" % (sz // 1024)
+                else:
+                    sz_str = "%dMB" % (sz // 1048576)
+                lines.append("  [file] %s  (%s)" % (e, sz_str))
+        if not lines:
+            lines.append("  (empty directory)")
+        return {"output": "Directory: %s\n\n%s" % (dpath, "\n".join(lines)), "success": True}
+    except Exception as e:
+        return {"output": "List error: %s" % e, "success": False}
+
+def update_plan(plan, explanation=None):
+    output = "Plan updated (%d steps):\n\n" % len(plan)
+    status_icons = {"pending": "○", "in_progress": "◐", "completed": "●"}
+    for i, s in enumerate(plan, 1):
+        icon = status_icons.get(s.get("status", "pending"), "?")
+        output += "%d. %s %s\n" % (i, icon, s.get("step", ""))
+    if explanation:
+        output += "\nNote: %s" % explanation
+    return {"output": output, "success": True, "plan": plan}
+
+def git_commit(message, files=None, branch=None):
+    try:
+        cwd = CWD
+        if files:
+            for f in files:
+                r = subprocess.run(["git", "add", f], capture_output=True, text=True, cwd=cwd)
+                if r.returncode != 0:
+                    return {"output": "git add failed: %s" % r.stderr, "success": False}
+        else:
+            r = subprocess.run(["git", "add", "-A"], capture_output=True, text=True, cwd=cwd)
+            if r.returncode != 0:
+                return {"output": "git add failed: %s" % r.stderr, "success": False}
+        cmd = ["git", "commit", "-m", message]
+        if branch:
+            cmd.extend(["--branch", branch])
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+        output = (r.stdout or "").strip()
+        if r.stderr:
+            output += ("\n" if output else "") + r.stderr.strip()
+        return {"output": output or "[no output]", "success": r.returncode == 0, "exit_code": r.returncode}
+    except Exception as e:
+        return {"output": "Git commit error: %s" % e, "success": False}
+
+def validate_changes(command, description=None):
+    output = "Validation: %s\n\n" % (description or command)
+    try:
+        r = subprocess.run(
+            command, shell=True, capture_output=True, text=True,
+            timeout=CMD_TIMEOUT, cwd=CWD,
+        )
+        output += (r.stdout or "").strip()
+        if r.stderr:
+            output += ("\n" if output else "") + "[stderr] %s" % r.stderr.strip()
+        output += "\n[exit code: %d]" % r.returncode
+        return {"output": output.strip(), "success": r.returncode == 0, "exit_code": r.returncode}
+    except subprocess.TimeoutExpired:
+        return {"output": output + "\n[timeout after %ds]" % CMD_TIMEOUT, "success": False, "exit_code": -1}
+    except Exception as e:
+        return {"output": output + "\n[error: %s]" % e, "success": False, "exit_code": -1}
+
+def list_git_changes(mode="status", args=""):
+    try:
+        cwd = CWD
+        cmd_map = {
+            "status": ["git", "status"],
+            "log": ["git", "log", "--oneline", "-20"],
+            "diff": ["git", "diff"],
+            "branch": ["git", "branch", "-a"],
+        }
+        cmd = cmd_map.get(mode, ["git", "status"])
+        if args:
+            cmd.extend(args.split())
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=30)
+        output = (r.stdout or "").strip()
+        if r.stderr:
+            output += ("\n" if output else "") + r.stderr.strip()
+        return {"output": output or "[no output]", "success": r.returncode == 0, "exit_code": r.returncode}
+    except Exception as e:
+        return {"output": "Git error: %s" % e, "success": False}
+
+def grep_search(pattern, path=None, include=None, case_insensitive=False):
+    try:
+        search_path = path or CWD
+        cmd = ["grep", "-rn"]
+        if case_insensitive:
+            cmd.append("-i")
+        if include:
+            cmd.extend(["--include=%s" % include])
+        cmd.extend([pattern, search_path])
+        try:
+            r = subprocess.run(["rg", "-n", "--no-heading"] +
+                               (["-i"] if case_insensitive else []) +
+                               (["-g", include] if include else []) +
+                               [pattern, search_path],
+                               capture_output=True, text=True, timeout=30)
+            if r.returncode != 127:
+                output = r.stdout.strip()
+                if r.returncode == 1 and not output:
+                    return {"output": "No matches for: %s" % pattern, "success": True}
+                if len(output) > 8000:
+                    output = output[:8000] + "\n\n[truncated — results too long]"
+                return {"output": output or "[no matches]", "success": True}
+        except FileNotFoundError:
+            pass
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        output = r.stdout.strip()
+        if not output:
+            return {"output": "No matches for: %s" % pattern, "success": True}
+        if len(output) > 8000:
+            output = output[:8000] + "\n\n[truncated — results too long]"
+        return {"output": output, "success": True}
+    except Exception as e:
+        return {"output": "Search error: %s" % e, "success": False}
+
+def analyze_code(path):
+    try:
+        fpath = os.path.expanduser(path)
+        if os.path.isfile(fpath):
+            return _analyze_single_file(fpath)
+        elif os.path.isdir(fpath):
+            return _analyze_directory(fpath)
+        else:
+            return {"output": "Path not found: %s" % path, "success": False}
+    except Exception as e:
+        return {"output": "Analysis error: %s" % e, "success": False}
+
+def _analyze_single_file(fpath):
+    try:
+        with open(fpath, "r", errors="replace") as f:
+            lines = f.readlines()
+        total = len(lines)
+        blank = sum(1 for l in lines if l.strip() == "")
+        code = total - blank
+        funcs = []
+        classes = []
+        imports = []
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if re.match(r'^(def|async def)\s+', stripped):
+                funcs.append((i, stripped.split("(")[0].replace("def ", "").replace("async ", "")))
+            elif re.match(r'^class\s+', stripped):
+                classes.append((i, stripped.split("(")[0].replace("class ", "")))
+            elif stripped.startswith("import ") or stripped.startswith("from "):
+                imports.append(stripped.split("#")[0].strip())
+        ext = os.path.splitext(fpath)[1]
+        output = "File: %s (%s)\n" % (os.path.basename(fpath), ext or "unknown")
+        output += "Lines: %d total, %d code, %d blank\n" % (total, code, blank)
+        if imports:
+            output += "Imports (%d):\n" % len(imports)
+            for imp in imports[:20]:
+                output += "  - %s\n" % imp
+        if classes:
+            output += "Classes (%d):\n" % len(classes)
+            for ln, name in classes:
+                output += "  L%d: class %s\n" % (ln, name)
+        if funcs:
+            output += "Functions (%d):\n" % len(funcs)
+            for ln, name in funcs[:30]:
+                output += "  L%d: %s\n" % (ln, name)
+        return {"output": output.strip(), "success": True}
+    except Exception as e:
+        return {"output": "File analysis error: %s" % e, "success": False}
+
+def _analyze_directory(dpath):
+    try:
+        file_count = 0
+        total_lines = 0
+        ext_counts = {}
+        for root, dirs, files in os.walk(dpath):
+            dirs[:] = [d for d in dirs if d not in ('.git', 'node_modules', '__pycache__', '.tox', 'venv')]
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                ext = os.path.splitext(fname)[1] or "(no ext)"
+                ext_counts[ext] = ext_counts.get(ext, 0) + 1
+                file_count += 1
+                try:
+                    with open(fpath, "r", errors="replace") as f:
+                        total_lines += sum(1 for _ in f)
+                except Exception:
+                    pass
+        output = "Directory: %s\n" % dpath
+        output += "Files: %d | Total lines: %d\n\n" % (file_count, total_lines)
+        output += "By extension:\n"
+        for ext, count in sorted(ext_counts.items(), key=lambda x: -x[1])[:15]:
+            output += "  %s: %d files\n" % (ext, count)
+        return {"output": output.strip(), "success": True}
+    except Exception as e:
+        return {"output": "Directory analysis error: %s" % e, "success": False}
+
+# ── Tool dispatch ──────────────────────────────────────────────────────────
 TOOL_DISPATCH = {
     "execute_shell_command": lambda a: execute_shell_command(a.get("command", ""), a.get("working_directory")),
     "web_search":            lambda a: web_search(a.get("query", "")),
     "web_fetch":             lambda a: web_fetch(a.get("url", "")),
-    "read_file":             lambda a: read_file(a.get("path", ".")),
+    "read_file":             lambda a: read_file(a.get("path", "")),
     "write_file":            lambda a: write_file(a.get("path", ""), a.get("content", "")),
-    "list_directory":        lambda a: list_directory(a.get("path", ".")),
-    "update_plan":           lambda a: update_plan(a.get("plan", []), a.get("explanation", "")),
-    "git_commit":            lambda a: git_commit(a.get("message", ""), a.get("files", "."), a.get("branch", "")),
+    "list_directory":        lambda a: list_directory(a.get("path")),
+    "update_plan":           lambda a: update_plan(a.get("plan", []), a.get("explanation")),
+    "git_commit":            lambda a: git_commit(a.get("message", ""), a.get("files"), a.get("branch")),
     "validate_changes":      lambda a: validate_changes(a.get("command", ""), a.get("description", "")),
     "list_git_changes":      lambda a: list_git_changes(a.get("mode", "status"), a.get("args", "")),
+    "grep_search":           lambda a: grep_search(a.get("pattern", ""), a.get("path"), a.get("include"), a.get("case_insensitive", False)),
+    "analyze_code":          lambda a: analyze_code(a.get("path", "")),
 }
 
-# ── LLM streaming ─────────────────────────────────────────────────────────
+def parse_code_blocks(text):
+    cmds, in_block, cur = [], False, []
+    for line in text.split("\n"):
+        s = line.strip()
+        if s.startswith("```bash") or s.startswith("```sh"):
+            in_block, cur = True, []
+            continue
+        if s == "```" and in_block:
+            if cur:
+                cmds.append("\n".join(cur))
+            in_block = False
+            continue
+        if in_block:
+            cur.append(line)
+    return cmds
 
+# ── LLM streaming ─────────────────────────────────────────────────────────
 def call_llm_stream(provider, messages, model="", tools=None):
     model = get_model(provider, model)
     api_key = get_api_key(provider)
@@ -333,21 +877,30 @@ def call_llm_stream(provider, messages, model="", tools=None):
         payload["tool_choice"] = "auto"
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    if provider != "ollama" or api_key: headers["Authorization"] = f"Bearer {api_key}"
-    return urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers), timeout=600 if provider == "ollama" else 300)
+    if provider != "ollama" or api_key:
+        headers["Authorization"] = "Bearer %s" % api_key
+    req = urllib.request.Request(url, data=data, headers=headers)
+    timeout = 600 if provider == "ollama" else 300
+    return urllib.request.urlopen(req, timeout=timeout)
 
 def iter_openai_stream(resp):
     for raw in resp:
         line = raw.decode("utf-8", errors="replace").strip()
-        if not line.startswith("data: "): continue
+        if not line.startswith("data: "):
+            continue
         data = line[6:]
-        if data == "[DONE]": break
+        if data == "[DONE]":
+            break
         try:
             chunk = json.loads(data)
             choice = chunk.get("choices", [{}])[0]
-            yield {"delta": choice.get("delta", {}), "finish_reason": choice.get("finish_reason"),
-                   "usage": chunk.get("usage")}
-        except: continue
+            yield {
+                "delta": choice.get("delta", {}),
+                "finish_reason": choice.get("finish_reason"),
+                "usage": chunk.get("usage"),
+            }
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
 
 def iter_ollama_stream(resp):
     buf = b""
@@ -355,68 +908,56 @@ def iter_ollama_stream(resp):
         buf += chunk
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
-            if not line.strip(): continue
+            if not line.strip():
+                continue
             try:
                 obj = json.loads(line.strip().decode("utf-8", errors="replace"))
                 msg = obj.get("message", {})
                 delta = {}
-                if msg.get("content"): delta["content"] = msg["content"]
-                if msg.get("tool_calls"): delta["tool_calls"] = msg["tool_calls"]
-                yield {"delta": delta, "finish_reason": "stop" if obj.get("done") else None,
-                       "usage": {"prompt_tokens": obj.get("prompt_eval_count", 0), "completion_tokens": obj.get("eval_count", 0)} if obj.get("done") else None}
-            except: continue
+                if msg.get("content"):
+                    delta["content"] = msg["content"]
+                if msg.get("tool_calls"):
+                    delta["tool_calls"] = msg["tool_calls"]
+                usage = None
+                if obj.get("done"):
+                    usage = {
+                        "prompt_tokens": obj.get("prompt_eval_count", 0),
+                        "completion_tokens": obj.get("eval_count", 0),
+                    }
+                yield {
+                    "delta": delta,
+                    "finish_reason": "stop" if obj.get("done") else None,
+                    "usage": usage,
+                }
+            except (json.JSONDecodeError, KeyError):
+                continue
 
 # ── Ollama discovery ──────────────────────────────────────────────────────
-
 def discover_ollama_models():
     try:
-        resp = urllib.request.urlopen(f"{OLLAMA_HOST.rstrip('/')}/api/tags", timeout=5)
-        PROVIDERS["ollama"]["models"] = sorted(m.get("name", "") for m in json.loads(resp.read().decode()).get("models", []) if m.get("name"))
+        resp = urllib.request.urlopen("%s/api/tags" % OLLAMA_HOST.rstrip("/"), timeout=5)
+        PROVIDERS["ollama"]["models"] = sorted(
+            m.get("name", "")
+            for m in json.loads(resp.read().decode()).get("models", [])
+            if m.get("name")
+        )
         return PROVIDERS["ollama"]["models"]
-    except: return []
+    except Exception:
+        return []
 
 def discover_ollama_running():
-    try: return urllib.request.urlopen(f"{OLLAMA_HOST.rstrip('/')}/api/tags", timeout=3).status == 200
-    except: return False
-
-# ── Session persistence ───────────────────────────────────────────────────
-
-def save_session(session_id, messages, plan):
     try:
-        os.makedirs(SESSION_DIR, exist_ok=True)
-        data = {"id": session_id, "messages": messages, "plan": plan, "saved_at": time.time()}
-        with open(os.path.join(SESSION_DIR, f"{session_id}.json"), "w") as f:
-            json.dump(data, f)
-        return True
-    except: return False
-
-def load_session(session_id):
-    try:
-        with open(os.path.join(SESSION_DIR, f"{session_id}.json"), "r") as f:
-            return json.load(f)
-    except: return None
-
-def list_sessions():
-    try:
-        sessions = []
-        if os.path.isdir(SESSION_DIR):
-            for fn in sorted(os.listdir(SESSION_DIR), reverse=True):
-                if fn.endswith(".json"):
-                    try:
-                        with open(os.path.join(SESSION_DIR, fn)) as f:
-                            d = json.load(f)
-                        sessions.append({"id": d.get("id", fn[:-5]), "saved_at": d.get("saved_at", 0), "messages": len(d.get("messages", []))})
-                    except: pass
-        return sessions
-    except: return []
+        return urllib.request.urlopen("%s/api/tags" % OLLAMA_HOST.rstrip("/"), timeout=3).status == 200
+    except Exception:
+        return False
 
 # ── Agentic loop ───────────────────────────────────────────────────────────
-
 class AgenticLoop:
-    def __init__(self, handler, provider, model):
+    def __init__(self, handler, provider, model, session_id):
         self.handler = handler
         self.provider = provider
         self.model = model
+        self.session_id = session_id
         self.messages = []
         self.iteration = 0
         self.plan = []
@@ -425,7 +966,9 @@ class AgenticLoop:
     def run(self, user_messages):
         sys_prompt = build_system_prompt()
         sys_ctx = get_system_context()
-        self.messages = [{"role": "system", "content": sys_prompt + "\n\n--- System Context ---\n" + sys_ctx}] + list(user_messages)
+        self.messages = [
+            {"role": "system", "content": sys_prompt + "\n\n--- System Context ---\n" + sys_ctx}
+        ] + list(user_messages)
 
         while self.iteration < MAX_ITERS:
             self.iteration += 1
@@ -433,7 +976,8 @@ class AgenticLoop:
             try:
                 resp = call_llm_stream(self.provider, self.messages, self.model, tools=ALL_TOOLS)
             except Exception as e:
-                self.handler._sse("error", f"LLM call failed: {e}"); return
+                self.handler._sse("error", "LLM call failed: %s" % e)
+                return
 
             full_content = ""
             tool_calls_raw = {}
@@ -451,202 +995,424 @@ class AgenticLoop:
                     full_content += content
                     self.handler._sse("token", content)
                 for tc in delta.get("tool_calls", []):
-                    if not isinstance(tc, dict): continue
+                    if not isinstance(tc, dict):
+                        continue
                     idx = tc.get("index", 0)
                     if idx not in tool_calls_raw:
-                        tool_calls_raw[idx] = {"id": tc.get("id", ""), "type": "function", "function": {"name": "", "arguments": ""}}
+                        tool_calls_raw[idx] = {
+                            "id": tc.get("id", ""),
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
                     entry = tool_calls_raw[idx]
-                    if tc.get("id"): entry["id"] = tc["id"]
+                    if tc.get("id"):
+                        entry["id"] = tc["id"]
                     func = tc.get("function", {})
-                    if func.get("name"): entry["function"]["name"] = func["name"]
-                    if func.get("arguments"): entry["function"]["arguments"] += func["arguments"]
+                    if func.get("name"):
+                        entry["function"]["name"] = func["name"]
+                    if func.get("arguments"):
+                        entry["function"]["arguments"] += func["arguments"]
 
             assistant_msg = {"role": "assistant", "content": full_content or None}
             if tool_calls_raw:
-                assistant_msg["tool_calls"] = [tool_calls_raw[k] for k in sorted(tool_calls_raw.keys())]
+                assistant_msg["tool_calls"] = [
+                    tool_calls_raw[k] for k in sorted(tool_calls_raw.keys())
+                ]
             self.messages.append(assistant_msg)
 
             if not tool_calls_raw:
                 self.handler._sse("done", full_content)
                 self.handler._sse("tokens_final", self.tokens_used)
-                # Auto-save session
-                session_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:12]
-                save_session(session_id, self.messages, self.plan)
-                self.handler._sse("session_saved", session_id)
+                sessions.add_message(self.session_id, "assistant", full_content)
+                sessions.save_to_disk(self.session_id)
+                self.handler._sse("session_saved", self.session_id)
                 return
 
             for tc in assistant_msg["tool_calls"]:
                 func_name = tc["function"]["name"]
-                try: args = json.loads(tc["function"]["arguments"])
-                except: args = {}
+                try:
+                    args = json.loads(tc["function"]["arguments"])
+                except (json.JSONDecodeError, ValueError):
+                    args = {}
 
-                self.handler._sse("tool_call", {"id": tc.get("id", ""), "name": func_name, "args": args})
+                self.handler._sse("tool_call", {
+                    "id": tc.get("id", ""),
+                    "name": func_name,
+                    "args": args,
+                })
                 dispatcher = TOOL_DISPATCH.get(func_name)
-                result = dispatcher(args) if dispatcher else {"output": f"Unknown tool: {func_name}", "success": False}
+                result = dispatcher(args) if dispatcher else {
+                    "output": "Unknown tool: %s" % func_name,
+                    "success": False,
+                }
 
-                # Track plan updates
+                audit.log(self.session_id, func_name, args, result)
+
                 if func_name == "update_plan" and "plan" in result:
                     self.plan = result["plan"]
                     self.handler._sse("plan", self.plan)
+                    sessions.set_plan(self.session_id, self.plan)
 
-                self.handler._sse("tool_result", {"id": tc.get("id", ""), "name": func_name, "output": result["output"], "success": result.get("success", False), "exit_code": result.get("exit_code")})
-                self.messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": result["output"]})
+                self.handler._sse("tool_result", {
+                    "id": tc.get("id", ""),
+                    "name": func_name,
+                    "output": result["output"],
+                    "success": result.get("success", False),
+                    "exit_code": result.get("exit_code"),
+                    "retries": result.get("retries", 0),
+                })
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "content": result["output"],
+                })
 
-        self.handler._sse("done", f"\n\n[Reached maximum iterations ({MAX_ITERS})]")
+        self.handler._sse("done", "\n\n[Reached maximum iterations (%d)]" % MAX_ITERS)
 
     def run_fallback(self, user_messages):
         sys_prompt = build_system_prompt()
         sys_ctx = get_system_context()
-        self.messages = [{"role": "system", "content": sys_prompt + "\n\n--- System Context ---\n" + sys_ctx}] + list(user_messages)
+        self.messages = [
+            {"role": "system", "content": sys_prompt + "\n\n--- System Context ---\n" + sys_ctx}
+        ] + list(user_messages)
         while self.iteration < MAX_ITERS:
             self.iteration += 1
             self.handler._sse("iteration", str(self.iteration))
-            try: resp = call_llm_stream(self.provider, self.messages, self.model)
-            except Exception as e: self.handler._sse("error", f"LLM call failed: {e}"); return
+            try:
+                resp = call_llm_stream(self.provider, self.messages, self.model)
+            except Exception as e:
+                self.handler._sse("error", "LLM call failed: %s" % e)
+                return
             full_content = ""
             iter_fn = iter_ollama_stream if self.provider == "ollama" else iter_openai_stream
             for chunk in iter_fn(resp):
                 c = chunk.get("delta", {}).get("content", "")
-                if c: full_content += c; self.handler._sse("token", c)
+                if c:
+                    full_content += c
+                    self.handler._sse("token", c)
             self.messages.append({"role": "assistant", "content": full_content})
-            commands = _parse_code_blocks(full_content)
-            if not commands: self.handler._sse("done", full_content); return
+            commands = parse_code_blocks(full_content)
+            if not commands:
+                self.handler._sse("done", full_content)
+                sessions.add_message(self.session_id, "assistant", full_content)
+                sessions.save_to_disk(self.session_id)
+                return
             results_text = ""
             for cmd in commands:
-                self.handler._sse("tool_call", {"id": f"fb-{self.iteration}", "name": "execute_shell_command", "args": {"command": cmd}})
+                self.handler._sse("tool_call", {
+                    "id": "fb-%d" % time.time(),
+                    "name": "execute_shell_command",
+                    "args": {"command": cmd},
+                })
                 result = execute_shell_command(cmd)
-                self.handler._sse("tool_result", {"id": f"fb-{self.iteration}", "name": "execute_shell_command", "output": result["output"], "success": result["success"], "exit_code": result.get("exit_code")})
-                results_text += f"$ {cmd}\n{result['output']}\n\n"
-            self.messages.append({"role": "user", "content": f"Command results:\n{results_text}\nContinue. If failed, fix and retry. If done, summarize."})
-        self.handler._sse("done", f"\n\n[Reached maximum iterations ({MAX_ITERS})]")
+                audit.log(self.session_id, "execute_shell_command", {"command": cmd}, result)
+                results_text += "\n\n--- Command: %s ---\n%s" % (cmd, result["output"])
+                self.handler._sse("tool_result", {
+                    "id": "fb-%d" % time.time(),
+                    "name": "execute_shell_command",
+                    "output": result["output"],
+                    "success": result["success"],
+                    "exit_code": result.get("exit_code"),
+                })
+            self.messages.append({"role": "user", "content": "Command results:\n%s\n\nContinue working." % results_text})
 
-def _parse_code_blocks(text):
-    cmds, in_block, cur = [], False, []
-    for line in text.split("\n"):
-        s = line.strip()
-        if s.startswith("```bash") or s.startswith("```sh"): in_block, cur = True, []; continue
-        if s == "```" and in_block:
-            if cur: cmds.append("\n".join(cur))
-            in_block = False; continue
-        if in_block: cur.append(line)
-    return cmds
-
-# ── HTTP Server ────────────────────────────────────────────────────────────
-
+# ── HTTP Handler ───────────────────────────────────────────────────────────
 class AgentHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
+    def log_message(self, fmt, *args):
+        log.debug(fmt, *args)
 
-    def send_json(self, data, status=200):
-        body = json.dumps(data).encode()
+    def _cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Session-ID, X-API-Secret")
+
+    def _json_response(self, data, status=200):
+        body = json.dumps(data).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html_response(self, html, status=200):
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self._cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self):
         self.send_response(204)
-        for h, v in [("Access-Control-Allow-Origin", "*"), ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"), ("Access-Control-Allow-Headers", "Content-Type")]:
-            self.send_header(h, v)
+        self._cors_headers()
         self.end_headers()
 
     def do_GET(self):
-        path = self.path.split("?")[0]
-        if path in ("/", "/index.html"): self._serve_file("templates/index.html", "text/html")
-        elif path.startswith("/static/"):
-            ct = {"css": "text/css", "js": "text/javascript"}.get(path.rsplit(".", 1)[-1] if "." in path else "", "application/octet-stream")
-            self._serve_file(path[1:], ct)
-        elif path == "/api/health":
-            self.send_json({"status": "ok", "version": "5.0", "tools": [t["function"]["name"] for t in ALL_TOOLS], "cwd": CWD, "approval_mode": APPROVAL_MODE})
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/":
+            self._serve_dashboard()
+        elif path == "/health":
+            self._json_response({
+                "status": "ok",
+                "version": VERSION,
+                "uptime": int(time.time() - _start_time),
+                "tools": len(ALL_TOOLS),
+                "providers": {
+                    k: {
+                        "key_set": bool(get_api_key(k)),
+                        "models": len(v.get("models", [])),
+                    }
+                    for k, v in PROVIDERS.items()
+                },
+            })
         elif path == "/api/providers":
             result = {}
-            for k, v in PROVIDERS.items():
-                models = v["models"] if k != "ollama" else discover_ollama_models()
-                result[k] = {"name": v["name"], "models": models, "needs_key": v["needs_key"], "key_set": bool(get_api_key(k)), "supports_tools": v.get("supports_tools", False)}
-            self.send_json(result)
-        elif path == "/api/system": self.send_json({"context": get_system_context(), "cwd": CWD, "agents_md": bool(load_agents_md())})
-        elif path == "/api/sessions": self.send_json({"sessions": list_sessions()})
-        elif path.startswith("/api/session/"):
-            sid = path.split("/")[-1]
-            session = load_session(sid)
-            if session: self.send_json(session)
-            else: self.send_json({"error": "not found"}, 404)
-        elif path == "/api/cwd": self.send_json({"cwd": CWD})
-        else: self.send_error(404)
+            for pid, info in PROVIDERS.items():
+                models = list(info.get("models", []))
+                if pid == "ollama" and not models:
+                    discover_ollama_models()
+                    models = list(info.get("models", []))
+                result[pid] = {"name": info["name"], "models": models}
+            self._json_response(result)
+        elif path == "/api/cwd":
+            self._json_response({"cwd": CWD})
+        elif path == "/api/sessions":
+            self._json_response({"sessions": sessions.list_sessions()})
+        elif path == "/api/audit":
+            self._json_response({"entries": audit.recent(50)})
+        elif path.startswith("/static/"):
+            self._serve_static(path[8:])
+        else:
+            self.send_error(404)
 
     def do_POST(self):
-        path = self.path.split("?")[0]
-        if path == "/api/chat": self._handle_chat()
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/api/chat":
+            self._handle_chat()
         elif path == "/api/cwd":
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) if self.headers.get("Content-Length") else b"{}")
-            new_cwd = body.get("cwd", "")
-            if new_cwd and os.path.isdir(new_cwd):
-                global CWD; CWD = os.path.abspath(new_cwd)
-                self.send_json({"cwd": CWD})
-            else: self.send_json({"error": "invalid path"}, 400)
-        elif path == "/api/execute":
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) if self.headers.get("Content-Length") else b"{}")
-            self.send_json(execute_shell_command(body.get("command", ""), body.get("cwd")))
-        else: self.send_error(404)
+            self._handle_set_cwd()
+        elif path == "/api/sessions/load":
+            self._handle_load_session()
+        else:
+            self.send_error(404)
 
-    def _serve_file(self, fp, ct):
-        fpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), fp)
+    def _serve_dashboard(self):
+        fpath = os.path.join(os.path.dirname(__file__), "templates", "index.html")
         try:
-            with open(fpath, "rb") as f: data = f.read()
-            self.send_response(200); self.send_header("Content-Type", ct); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
-        except FileNotFoundError: self.send_error(404)
+            with open(fpath, "r") as f:
+                self._html_response(f.read())
+        except FileNotFoundError:
+            self._html_response("<h1>ShellAgent</h1><p>templates/index.html not found</p>", 404)
+
+    def _serve_static(self, relpath):
+        fpath = os.path.join(os.path.dirname(__file__), "static", relpath)
+        ct_map = {".css": "text/css", ".js": "application/javascript", ".png": "image/png", ".svg": "image/svg+xml"}
+        ext = os.path.splitext(relpath)[1]
+        ct = ct_map.get(ext, "application/octet-stream")
+        try:
+            with open(fpath, "rb") as f:
+                data = f.read()
+            accept = self.headers.get("Accept-Encoding", "")
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self._cors_headers()
+            if "gzip" in accept and len(data) > 500:
+                compressed = gzip.compress(data)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(compressed)))
+                self.end_headers()
+                self.wfile.write(compressed)
+            else:
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        except FileNotFoundError:
+            self.send_error(404)
+
+    def _handle_set_cwd(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 10000:
+                self._json_response({"error": "Request too large"}, 413)
+                return
+            body = json.loads(self.rfile.read(length))
+            new_cwd = body.get("cwd", "").strip()
+            if not new_cwd or not os.path.isdir(new_cwd):
+                self._json_response({"error": "Invalid directory"}, 400)
+                return
+            global CWD
+            CWD = new_cwd
+            self._json_response({"cwd": CWD, "ok": True})
+        except Exception as e:
+            self._json_response({"error": str(e)}, 500)
+
+    def _handle_load_session(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            sid = body.get("session_id", "")
+            data = sessions.load_from_disk(sid)
+            if data:
+                self._json_response({"session": data})
+            else:
+                self._json_response({"error": "Session not found"}, 404)
+        except Exception as e:
+            self._json_response({"error": str(e)}, 500)
 
     def _handle_chat(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) if self.headers.get("Content-Length") else b"{}")
-        messages, provider, model = body.get("messages", []), body.get("provider", DEFAULT_PROVIDER), body.get("model", "")
-        if provider not in PROVIDERS: self.send_json({"error": f"unknown provider: {provider}"}, 400); return
-        if PROVIDERS[provider]["needs_key"] and not get_api_key(provider):
-            self.send_json({"error": f"Set {PROVIDERS[provider]['env_key']}"}, 400); return
-        self.send_response(200)
-        for h, v in [("Content-Type", "text/event-stream"), ("Cache-Control", "no-cache"), ("Connection", "keep-alive"), ("Access-Control-Allow-Origin", "*")]:
-            self.send_header(h, v)
-        self.end_headers()
         try:
-            loop = AgenticLoop(self, provider, model)
-            if PROVIDERS.get(provider, {}).get("supports_tools"): loop.run(messages)
-            else: loop.run_fallback(messages)
-        except Exception as e: self._sse("error", f"Fatal: {e}")
-        finally:
-            try: self.wfile.write(b""); self.wfile.flush()
-            except: pass
+            length = int(self.headers.get("Content-Length", 0))
+            if length > MAX_REQ_BODY:
+                self._json_response({"error": "Request too large (max %d bytes)" % MAX_REQ_BODY}, 413)
+                return
+
+            if not rate_limiter.allow(self.client_address[0]):
+                self._json_response({"error": "Rate limit exceeded (60 req/min)"}, 429)
+                return
+
+            body = json.loads(self.rfile.read(length))
+            messages = body.get("messages", [])
+            provider = body.get("provider", DEFAULT_PROVIDER)
+            model = body.get("model", "")
+            session_id = self.headers.get("X-Session-ID", secrets.token_hex(8))
+
+            if not messages:
+                self._json_response({"error": "No messages"}, 400)
+                return
+
+            total_input = sum(len(m.get("content", "")) for m in messages)
+            if total_input > MAX_CHAT_INPUT:
+                self._json_response({
+                    "error": "Input too large (%d chars, max %d)" % (total_input, MAX_CHAT_INPUT),
+                }, 400)
+                return
+
+            if provider not in PROVIDERS:
+                self._json_response({"error": "Unknown provider: %s" % provider}, 400)
+                return
+            if PROVIDERS[provider]["needs_key"] and not get_api_key(provider):
+                self._json_response({
+                    "error": "Set %s" % PROVIDERS[provider]["env_key"],
+                }, 400)
+                return
+
+            sessions.get_or_create(session_id)
+            for m in messages:
+                if m.get("role") in ("user", "assistant") and m.get("content"):
+                    sessions.add_message(session_id, m["role"], m["content"])
+
+            self.send_response(200)
+            for h, v in [
+                ("Content-Type", "text/event-stream"),
+                ("Cache-Control", "no-cache"),
+                ("Connection", "keep-alive"),
+                ("X-Accel-Buffering", "no"),
+            ]:
+                self.send_header(h, v)
+            self._cors_headers()
+            self.end_headers()
+
+            try:
+                loop = AgenticLoop(self, provider, model, session_id)
+                if PROVIDERS.get(provider, {}).get("supports_tools"):
+                    loop.run(messages)
+                else:
+                    loop.run_fallback(messages)
+            except Exception as e:
+                log.error("Chat error: %s", traceback.format_exc())
+                self._sse("error", "Fatal: %s" % e)
+            finally:
+                try:
+                    self.wfile.write(b"")
+                    self.wfile.flush()
+                except Exception:
+                    pass
+
+        except json.JSONDecodeError:
+            self._json_response({"error": "Invalid JSON"}, 400)
+        except Exception as e:
+            log.error("Chat handler error: %s", e)
+            try:
+                self._json_response({"error": str(e)}, 500)
+            except Exception:
+                pass
 
     def _sse(self, event, data):
-        msg = f"event: {event}\ndata: {json.dumps({'type': event, 'data': data})}\n\n"
-        try: self.wfile.write(msg.encode()); self.wfile.flush()
-        except: pass
+        payload = json.dumps({"type": event, "data": data})
+        msg = "event: %s\ndata: %s\n\n" % (event, payload)
+        try:
+            self.wfile.write(msg.encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            pass
+
+# ── Graceful shutdown ──────────────────────────────────────────────────────
+_httpd = None
+
+def shutdown_handler(sig, frame):
+    log.info("Shutting down...")
+    if _httpd:
+        threading.Thread(target=_httpd.shutdown, daemon=True).start()
+    sys.exit(0)
 
 # ── Main ───────────────────────────────────────────────────────────────────
+_start_time = time.time()
+
+class _HTTPServer(http.server.HTTPServer):
+    allow_reuse_address = True
+
 
 def main():
-    ollama_info = f"✓ {len(discover_ollama_models())} model(s)" if discover_ollama_running() else "✗ not running"
-    tools_str = ", ".join(t["function"]["name"] for t in ALL_TOOLS)
-    agents_md = "✓ loaded" if load_agents_md() else "✗ not found"
-    print(f"""
-╔═══════════════════════════════════════════════════════╗
-║             ShellAgent v5.0                           ║
-║  Definitive Agent — Codex A-to-Z Feature Set         ║
-╠═══════════════════════════════════════════════════════╣
-║  Dashboard  : http://localhost:{PORT:<25}║
-║  Tools      : 10 ({tools_str})║
-║  Approval   : {APPROVAL_MODE:<42}║
-║  AGENTS.md  : {agents_md:<42}║
-║  Sessions   : {SESSION_DIR:<42}║
-╠═══════════════════════════════════════════════════════╣
-║  Providers                                            ║
-║  ├─ OpenAI  : {"✓ set" if OPENAI_API_KEY else "✗ not set":<42}║
-║  ├─ NVIDIA  : {"✓ set" if NVIDIA_API_KEY else "✗ not set":<42}║
-║  └─ Ollama  : {ollama_info:<42}║
-╚═══════════════════════════════════════════════════════╝
-""")
-    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
-    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
-    http.server.HTTPServer((HOST, PORT), AgentHandler).serve_forever()
+    global _httpd
+
+    ollama_info = "running, %d model(s)" % len(discover_ollama_models()) if discover_ollama_running() else "not running"
+    tools_count = len(ALL_TOOLS)
+    agents_md = "loaded" if load_agents_md() else "not found"
+    skills = load_skills()
+    skills_info = "loaded" if skills else "none"
+
+    log.info("ShellAgent v%s starting on http://%s:%s", VERSION, HOST, PORT)
+    log.info("Tools: %d | Approval: %s | AGENTS.md: %s | Skills: %s",
+             tools_count, APPROVAL_MODE, agents_md, skills_info)
+    log.info("API secret: %s...", API_SECRET[:8])
+
+    # --- Startup banner ---
+    border = '+' + '-' * 56 + '+'
+    print()
+    print(border)
+    print('| ShellAgent v%s' % VERSION)
+    print('| Codex-style Agent -- 12 Tools + Full Autonomy')
+    print(border)
+    print('| Dashboard  : http://localhost:%s' % PORT)
+    print('| Health     : http://localhost:%s/health' % PORT)
+    print('| Tools      : %d tools (shell+web+files+git+grep+analyze+plan)' % tools_count)
+    print('| Approval   : %s' % APPROVAL_MODE)
+    print('| Auto-retry : %d per command' % MAX_RETRIES)
+    print('| AGENTS.md  : %s' % agents_md)
+    print('| Skills     : %s' % skills_info)
+    print('| Sessions   : saved to %s' % SESSION_DIR)
+    print('| Rate Limit : 60 req/min')
+    print('| Max Body   : %dKB chat / %dKB input' % (MAX_REQ_BODY // 1000, MAX_CHAT_INPUT // 1000))
+    print(border)
+    print('| Providers:')
+    print('|   OpenAI  : %s' % ("set" if OPENAI_API_KEY else "not set"))
+    print('|   NVIDIA  : %s' % ("set" if NVIDIA_API_KEY else "not set"))
+    print('|   Ollama  : %s' % ollama_info)
+    print(border)
+    print()
+    if not any([OPENAI_API_KEY, NVIDIA_API_KEY]):
+        print("  Set at least one API key:")
+        print("    export OPENAI_API_KEY='sk-...'")
+        print("    export NVIDIA_API_KEY='nvapi-...'")
+        print("    Ollama works without a key if running locally\n")
+
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+
+    _httpd = _HTTPServer((HOST, PORT), AgentHandler)
+    _httpd.serve_forever()
 
 if __name__ == "__main__":
     main()
