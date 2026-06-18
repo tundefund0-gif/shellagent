@@ -1,4 +1,4 @@
-/* ─── ShellAgent v7.3 Frontend ─────────────────────────────────────── */
+/* ─── ShellAgent v7.4 Frontend ─────────────────────────────────────── */
 
 let chatHistory = [];
 let isStreaming = false;
@@ -82,6 +82,7 @@ function init() {
   userInput.focus();
   loadHistory();
   refreshSessions();
+  addGoalBtn();
 }
 
 // ─── Conversations Panel ─────────────────────────────────────────────
@@ -109,20 +110,17 @@ function renderConvPanel() {
     var age = Math.floor((Date.now() / 1000 - s.created_at) / 60);
     var ageStr = age < 1 ? 'just now' : age < 60 ? age + 'm ago' : Math.floor(age / 60) + 'h ago';
     var preview = s.preview || '(empty)';
-    html += '<div class="conv-card" onclick="loadConvSession(\'' + s.id + '\')">' +
-      '<button class="conv-card-del" onclick="event.stopPropagation();deleteConvSession(\'' + s.id + '\')" title="Delete">\u2716</button>' +
-      '<div class="conv-card-preview">' + h(preview) + '</div>' +
-      '<div class="conv-card-meta"><span class="conv-card-msgs">' + s.messages + ' msgs</span><span class="conv-card-time">' + ageStr + '</span></div>' +
-      '</div>';
-  }
-  convList.innerHTML = html;
-}
-
-function loadConvSession(sid) {
-  fetch('/api/sessions/load', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ session_id: sid }),
+  convList.innerHTML += '<div class="conv-card" onclick="loadConvSession(\'' + s.id + '\')">' +
+    '<div class="conv-card-preview">' + h(preview) + (s.archived ? ' [archived]' : '') + '</div>' +
+    '<div class="conv-card-meta">' +
+      '<span class="conv-card-msgs">' + s.messages + ' msgs</span>' +
+      '<span class="conv-card-time">' + ageStr + '</span>' +
+    '</div>' +
+    '<div class="conv-card-actions" style="position:absolute;top:6px;right:6px;display:flex;gap:2px;opacity:0;transition:opacity 0.15s">' +
+      '<button class="conv-card-btn" onclick="event.stopPropagation();archiveSession(\'' + s.id + '\',' + (s.archived ? 'true' : 'false') + ')" title="Archive">📦</button>' +
+      '<button class="conv-card-btn" onclick="event.stopPropagation();deleteConvSession(\'' + s.id + '\')" title="Delete">✕</button>' +
+    '</div>' +
+  '</div>';
   }).then(function(resp) { return resp.json(); }).then(function(data) {
     if (data.session && data.session.messages) {
       messagesEl.innerHTML = '';
@@ -152,6 +150,29 @@ function deleteConvSession(sid) {
   }).catch(function() {});
 }
 
+function archiveSession(sid, archived) {
+  var endpoint = '/api/sessions/' + (archived ? 'unarchive' : 'archive');
+  fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sid }),
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) refreshSessions();
+  });
+}
+
+function setGoal() {
+  var obj = prompt('Enter goal objective:');
+  if (!obj) return;
+  fetch('/api/goal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId, objective: obj }),
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) addSystemMsg('Goal set: ' + obj, false);
+  });
+}
+
 function refreshSessions() {
   fetch('/api/sessions').then(function(r) { return r.json(); }).then(function(data) {
     sessions = data.sessions || [];
@@ -176,6 +197,17 @@ function killRunningTask() {
   statusDot.className = 'status-dot';
   iterBadge.style.display = 'none';
   document.getElementById('killBtn').style.display = 'none';
+}
+
+function addGoalBtn() {
+  var goalBtn = document.createElement('button');
+  goalBtn.className = 'conv-btn';
+  goalBtn.innerHTML = '🎯';
+  goalBtn.onclick = setGoal;
+  goalBtn.title = 'Set goal';
+  goalBtn.setAttribute('aria-label', 'Set goal');
+  var cwdBtn = document.getElementById('cwdBtn');
+  if (cwdBtn && cwdBtn.parentNode) cwdBtn.parentNode.insertBefore(goalBtn, cwdBtn.nextSibling);
 }
 
 function setProvider(pid) {

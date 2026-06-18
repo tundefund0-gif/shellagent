@@ -23,7 +23,7 @@ logging.basicConfig(
 log = logging.getLogger("shellagent")
 
 # ── Configuration ──────────────────────────────────────────────────────────
-VERSION = "7.3"
+VERSION = "7.4"
 PORT            = int(os.environ.get("SHELLAGENT_PORT", "8765"))
 HOST            = os.environ.get("SHELLAGENT_HOST", "0.0.0.0")
 CWD             = os.environ.get("SHELLAGENT_CWD", os.getcwd())
@@ -48,6 +48,59 @@ OLLAMA_HOST     = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_API_KEY  = os.environ.get("OLLAMA_API_KEY", "")
 DEFAULT_PROVIDER = os.environ.get("SHELLAGENT_PROVIDER", "openai")
 DEFAULT_MODEL    = os.environ.get("SHELLAGENT_MODEL", "")
+
+# ── Goal / Objective tracking ───────────────────────────────────────────
+class Goal:
+    def __init__(self, objective, token_budget=None):
+        self.objective = objective
+        self.token_budget = token_budget
+        self.tokens_used = 0
+        self.status = "active"  # active, complete, blocked
+        self.created_at = time.time()
+
+    def to_dict(self):
+        return {
+            "objective": self.objective,
+            "token_budget": self.token_budget,
+            "tokens_used": self.tokens_used,
+            "status": self.status,
+            "created_at": self.created_at,
+        }
+
+    def remaining_tokens(self):
+        if self.token_budget:
+            return max(0, self.token_budget - self.tokens_used)
+        return None
+
+    def continuation_prompt(self):
+        remaining = self.remaining_tokens()
+        return (
+            "## Goal Continuation\n\n"
+            "You are continuing work on the following goal:\n"
+            "<goal>\n%s\n</goal>\n\n"
+            "Tokens used: %d | Token budget: %s | Remaining: %s\n\n"
+            "Continue working toward the goal. Do not repeat work already done."
+            " If the goal is achieved, call update_goal to mark it complete."
+        ) % (self.objective, self.tokens_used, 
+             str(self.token_budget or "none"),
+             str(remaining) if remaining is not None else "unbounded")
+
+_goals = {}
+_goals_lock = threading.Lock()
+
+def get_goal(session_id):
+    with _goals_lock:
+        return _goals.get(session_id)
+
+def set_goal(session_id, goal):
+    with _goals_lock:
+        _goals[session_id] = goal
+
+def clear_goal(session_id):
+    with _goals_lock:
+        _goals.pop(session_id, None)
+
+
 
 # --- Process tracking ---
 _running_procs = {}
@@ -135,6 +188,8 @@ class SessionStore:
                     "id": session_id,
                     "messages": [],
                     "plan": [],
+                    "goal": None,
+                    "archived": False,
                     "created_at": time.time(),
                 }
             return self._sessions[session_id]
@@ -196,6 +251,21 @@ class SessionStore:
             return data
         except Exception:
             return None
+
+    def archive_session(self, session_id):
+        with self._lock:
+            if session_id in self._sessions:
+                self._sessions[session_id]["archived"] = True
+                self.save_to_disk(session_id)
+
+    def unarchive_session(self, session_id):
+        with self._lock:
+            if session_id in self._sessions:
+                self._sessions[session_id]["archived"] = False
+
+    def list_archived_sessions(self):
+        with self._lock:
+            return [s for s in self._sessions.values() if s.get("archived")]
 
     def delete_session(self, session_id):
         """Delete a session from memory and disk."""
@@ -406,6 +476,14 @@ ALL_TOOLS = [
         }, "required": ["pattern"]},
     }},
     {"type": "function", "function": {
+        "name": "apply_patch",
+        "description": "Apply a unified diff patch to a file. Uses the `patch` command. Use this for surgical edits instead of rewriting entire files.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "File path to patch (absolute or relative to CWD)"},
+            "patch": {"type": "string", "description": "Unified diff patch text to apply"}, 
+        }, "required": ["path", "patch"]},
+    }},
+    {"type": "function", "function": {
         "name": "analyze_code",
         "description": "Analyze code structure: count lines, find functions/classes, identify imports and patterns.",
         "parameters": {"type": "object", "properties": {
@@ -435,11 +513,14 @@ def build_system_prompt():
         ## How you work (Codex-style)
         1. For multi-step tasks, call update_plan first to outline your approach
         2. Always start with a brief preamble (1-2 sentences) before heavy tool use
-        3. Execute tools, review output carefully
-        4. If something fails, diagnose and retry — you have up to 3 retries per tool
-        5. After code changes, run validate_changes
-        6. Commit meaningful progress with git_commit
-        7. End with a clear summary of what was done
+        3. Use apply_patch for surgical edits instead of writing entire files
+        4. Execute tools, review output carefully
+        5. If something fails, diagnose and retry — you have up to 3 retries per tool
+        6. After code changes, run validate_changes
+        7. Commit meaningful progress with git_commit
+        8. On each iteration, use review_exit to self-check before declaring done
+        9. When working on a goal, call update_goal to mark complete or blocked
+        10. End with a clear summary of what was done
 
         ## Approval Mode
         Approval mode is: {approval}
@@ -645,6 +726,23 @@ def execute_shell_command(command, working_directory=None, session_id=None):
                     pass
             safe_output = "[safely killed %d process(es) matching '%s']" % (killed, pat)
             return {"output": safe_output, "success": True, "exit_code": 0, "retries": 0}
+    # ── Command safety validation ──
+    _dangerous_patterns = [
+        "rm -rf /", "rm -rf --no-preserve-root", 
+        "mkfs", "dd if=", "> /dev/sd", "> /dev/nvme",
+        ":(){ :|:& };:", "chmod 000 /", "chown -R 0:0 /",
+        "wget -O- | sh", "curl -sL.*| sh", "curl -sL.*| bash",
+        "mv /* /dev/null", "dd if=/dev/zero",
+        "shutdown", "reboot", "poweroff", "init 0", "init 6",
+        "pkexec", "sudo !!",
+    ]
+    cmd_lower_safety = command.strip().lower()
+    for dangerous in _dangerous_patterns:
+        if dangerous in cmd_lower_safety:
+            safe_output = "[BLOCKED] Dangerous command detected: %s\nShellAgent blocked this for safety." % command
+            log.warning("Blocked dangerous command: %s", command[:100])
+            return {"output": safe_output, "success": False, "exit_code": -1, "retries": 0, "blocked": True}
+    
     # ── Server/daemon auto-detection ──
     # If the command starts a long-lived server, background it and return immediately
     _server_patterns = [
@@ -736,9 +834,12 @@ def execute_shell_command(command, working_directory=None, session_id=None):
             time.sleep(0.5 * retries)
     return {"output": last_output or "[exhausted retries]", "success": False, "exit_code": -1, "retries": retries}
 
-def web_search(query):
+def web_search(query, site_filter=None, max_results=8):
     try:
-        encoded = urllib.parse.quote_plus(query)
+        q = query
+        if site_filter:
+            q = "%s site:%s" % (q, site_filter)
+        encoded = urllib.parse.quote_plus(q)
         req = urllib.request.Request(
             "https://html.duckduckgo.com/html/?q=%s" % encoded,
             headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"},
@@ -756,7 +857,7 @@ def web_search(query):
                     href = urllib.parse.unquote(m2.group(1))
             if title.strip():
                 results.append({"title": title.strip(), "url": href.strip(), "snippet": snippet.strip()})
-            if len(results) >= 8:
+            if len(results) >= max_results:
                 break
         if not results:
             return {"output": "No results for: %s" % query, "success": True}
@@ -990,6 +1091,41 @@ def _analyze_single_file(fpath):
     except Exception as e:
         return {"output": "File analysis error: %s" % e, "success": False}
 
+
+# ── Apply Patch (Codex-style unified diff) ──────────────────────────────
+def apply_patch(path, patch_text):
+    """Apply a unified diff patch to a file. Returns result with success."""
+    try:
+        fpath = os.path.expanduser(path)
+        if not os.path.isfile(fpath):
+            return {"output": "File not found: %s" % path, "success": False}
+        
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as pf:
+            pf.write(patch_text)
+            pf.flush()
+            patch_path = pf.name
+        
+        try:
+            r = subprocess.run(
+                ["patch", "--forward", "--no-backup-if-mismatch", "-p0", "-i", patch_path],
+                capture_output=True, text=True, timeout=30, cwd=os.path.dirname(fpath) or os.getcwd(),
+            )
+            output = (r.stdout or "").strip()
+            if r.stderr:
+                output += ("\n" if output else "") + r.stderr.strip()
+            success = r.returncode == 0
+            if not success and "Reversed (or previously applied) patch" in output:
+                # Already applied — treat as success
+                success = True
+                output += "\n[Patch was already applied — skipping]"
+            return {"output": output or "[patch applied]", "success": success, "exit_code": r.returncode}
+        finally:
+            try: os.unlink(patch_path)
+            except: pass
+    except Exception as e:
+        return {"output": "Apply patch error: %s" % e, "success": False}
+
 def _analyze_directory(dpath):
     try:
         file_count = 0
@@ -1019,18 +1155,71 @@ def _analyze_directory(dpath):
 # ── Tool dispatch ──────────────────────────────────────────────────────────
 TOOL_DISPATCH = {
     "execute_shell_command": lambda a: execute_shell_command(a.get("command", ""), a.get("working_directory"), a.get("session_id")),
-    "web_search":            lambda a: web_search(a.get("query", "")),
+    "web_search":            lambda a: web_search(a.get("query", ""), a.get("site_filter"), a.get("max_results", 8)),
     "web_fetch":             lambda a: web_fetch(a.get("url", "")),
     "read_file":             lambda a: read_file(a.get("path", "")),
     "write_file":            lambda a: write_file(a.get("path", ""), a.get("content", "")),
     "list_directory":        lambda a: list_directory(a.get("path")),
     "update_plan":           lambda a: update_plan(a.get("plan", []), a.get("explanation")),
+    "update_goal":           lambda a: _handle_update_goal(a, session_id),
+    "review_exit":           lambda a: _handle_review_exit(a),
     "git_commit":            lambda a: git_commit(a.get("message", ""), a.get("files"), a.get("branch")),
     "validate_changes":      lambda a: validate_changes(a.get("command", ""), a.get("description", "")),
     "list_git_changes":      lambda a: list_git_changes(a.get("mode", "status"), a.get("args", "")),
     "grep_search":           lambda a: grep_search(a.get("pattern", ""), a.get("path"), a.get("include"), a.get("case_insensitive", False)),
     "analyze_code":          lambda a: analyze_code(a.get("path", "")),
+    "apply_patch":           lambda a: apply_patch(a.get("path", ""), a.get("patch", "")),
 }
+
+# ── Context compaction ──────────────────────────────────────────────────
+def compact_context(messages, max_tokens=16000):
+    """Compact long conversation histories by summarizing old messages."""
+    total = sum(len(str(m.get("content", ""))) for m in messages)
+    if total < max_tokens:
+        return messages
+    # Remove oldest non-system messages, keeping the last few
+    new_msgs = []
+    kept = 0
+    running = 0
+    for m in reversed(messages):
+        size = len(str(m.get("content", "")))
+        if running + size < max_tokens * 0.8:
+            new_msgs.insert(0, m)
+            running += size
+            kept += 1
+        elif m.get("role") == "system":
+            new_msgs.insert(0, m)
+    # If we removed too many, add a summary
+    removed = len(messages) - len(new_msgs)
+    if removed > 2:
+        summary = "[%d earlier messages compacted for context length]" % removed
+        # Insert after system prompt
+        for i, m in enumerate(new_msgs):
+            if m.get("role") == "system" and i + 1 < len(new_msgs) and new_msgs[i+1].get("role") != "system":
+                new_msgs.insert(i+1, {"role": "system", "content": summary})
+                break
+    return new_msgs
+
+
+
+# ── Goal/Review tool implementations ────────────────────────────────────
+def _handle_update_goal(args, sid):
+    status = args.get("status", "")
+    explanation = args.get("explanation", "")
+    goal = get_goal(sid)
+    if goal:
+        goal.status = status
+        if status == "complete":
+            clear_goal(sid)
+    return {"output": "Goal %s: %s" % (status, explanation or "No explanation"), "success": True}
+
+def _handle_review_exit(args):
+    checks = args.get("checks", "")
+    all_clear = args.get("all_clear", False)
+    if all_clear:
+        return {"output": "✅ Self-review passed:\n%s" % checks, "success": True}
+    else:
+        return {"output": "⚠️ Self-review found issues:\n%s\n\nContinue working to resolve them." % checks, "success": False}
 
 def parse_code_blocks(text):
     cmds, in_block, cur = [], False, []
@@ -1179,7 +1368,15 @@ class AgenticLoop:
         self.messages = [
             {"role": "system", "content": sys_prompt + "\n\n--- System Context ---\n" + sys_ctx}
         ] + list(user_messages)
+        # Check for active goal and add continuation prompt
+        goal = get_goal(self.session_id)
+        if goal and goal.status == "active" and self.iteration > 0:
+            self.messages.append({"role": "system", "content": goal.continuation_prompt()})
 
+        # Compact context if growing too large
+        if len(self.messages) > 20:
+            self.messages = compact_context(self.messages)
+        
         while self.iteration < MAX_ITERS:
             if _is_cancelled(self.session_id):
                 self.handler._sse("done", "[Task cancelled]")
@@ -1302,6 +1499,10 @@ class AgenticLoop:
         self.messages = [
             {"role": "system", "content": sys_prompt + "\n\n--- System Context ---\n" + sys_ctx}
         ] + list(user_messages)
+        # Compact context if growing too large
+        if len(self.messages) > 20:
+            self.messages = compact_context(self.messages)
+        
         while self.iteration < MAX_ITERS:
             if _is_cancelled(self.session_id):
                 self.handler._sse("done", "[Task cancelled]")
@@ -1431,10 +1632,16 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
             self._handle_set_cwd()
         elif path == "/api/sessions/load":
             self._handle_load_session()
+        elif path == "/api/goal":
+            self._handle_goal()
         elif path == "/api/custom_model":
             self._handle_custom_model()
         elif path == "/api/sessions/delete":
             self._handle_delete_session()
+        elif path == "/api/sessions/archive":
+            self._handle_archive_session()
+        elif path == "/api/sessions/unarchive":
+            self._handle_unarchive_session()
         elif path == "/api/sessions/clear":
             self._handle_clear_session()
         elif path == "/api/kill":
@@ -1541,6 +1748,45 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
                 self._json_response({"error": "Missing session_id"}, 400)
                 return
             sessions.clear_messages(session_id)
+            self._json_response({"ok": True})
+        except Exception as e:
+            self._json_response({"error": str(e)}, 500)
+
+    def _handle_goal(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            session_id = body.get("session_id", "")
+            objective = body.get("objective", "")
+            token_budget = body.get("token_budget")
+            if objective:
+                goal = Goal(objective, token_budget)
+                set_goal(session_id, goal)
+                self._json_response({"ok": True, "goal": goal.to_dict()})
+            else:
+                goal = get_goal(session_id)
+                self._json_response({"ok": True, "goal": goal.to_dict() if goal else None})
+        except Exception as e:
+            self._json_response({"error": str(e)}, 500)
+
+    def _handle_archive_session(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            session_id = body.get("session_id", "")
+            if session_id:
+                sessions.archive_session(session_id)
+            self._json_response({"ok": True})
+        except Exception as e:
+            self._json_response({"error": str(e)}, 500)
+
+    def _handle_unarchive_session(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            session_id = body.get("session_id", "")
+            if session_id:
+                sessions.unarchive_session(session_id)
             self._json_response({"ok": True})
         except Exception as e:
             self._json_response({"error": str(e)}, 500)

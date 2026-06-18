@@ -1,10 +1,136 @@
-# ShellAgent v7.3
+# ShellAgent v7.4
 
-**Codex-style agentic AI shell agent with 12 tools, web search, file ops, git, grep, code analysis, planning, auto-retry, process kill, conversation history, and zero dependencies.**
+**Full Codex CLI implementation — lightweight Python agent with 13 tools, apply_patch, goals, context compaction, command safety, session archiving, and zero dependencies.**
 
-Like Codex CLI — the AI uses function calling with a full agentic loop: search the web, read/write files, run commands, grep code, analyze structure, validate changes, commit to git, and track progress with plans. Supports **OpenAI**, **NVIDIA NIM**, and **Ollama** (local + cloud).
+Like Codex CLI — the AI uses function calling with a full agentic loop: search the web, read/write files, run commands, apply patches, grep code, analyze structure, validate changes, track goals, review exits, manage git, and track progress with plans. Supports **OpenAI**, **NVIDIA NIM**, and **Ollama**.
 
-![Python](https://img.shields.io/badge/python-3.8+-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Version](https://img.shields.io/badge/version-7.3-orange) ![Tools](https://img.shields.io/badge/tools-12-brightgreen)
+![Python](https://img.shields.io/badge/python-3.8+-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Version](https://img.shields.io/badge/version-7.4-orange) ![Tools](https://img.shields.io/badge/tools-13-brightgreen)
+
+## Codex CLI Features (A-to-Z)
+
+### Agentic Loop
+- Iterative tool-calling with LLM function calling
+- Auto-retry on failure (up to 3x with exponential backoff)
+- No command timeout by default (configurable, default 3600s)
+- Cancellation — stop any running task with the kill button
+- Background server detection — auto-backgrounds long-lived processes
+- Process group kill — properly kills child processes with shell=True
+
+### 13 Tools
+
+| Tool | Category | What it does |
+|---|---|---|
+| `execute_shell_command` | ⚡ Shell | Run any shell command (auto-retry, safety-checked) |
+| `web_search` | 🔍 Web | Search via DuckDuckGo (with site_filter, max_results) |
+| `web_fetch` | 🌐 Web | Fetch and read any URL |
+| `read_file` | 📖 Files | Read files with line numbers |
+| `write_file` | ✏️ Files | Create or overwrite files (auto-creates dirs) |
+| `apply_patch` | 📝 Patch | Apply unified diff patches (surgical edits) |
+| `list_directory` | 📁 Files | Explore directory structure |
+| `grep_search` | 🔎 Search | Regex search across files (ripgrep when available) |
+| `analyze_code` | 🔬 Analysis | Count lines, find functions/classes, identify imports |
+| `update_plan` | 📋 Planning | Track task steps with pending/in-progress/completed |
+| `update_goal` | 🎯 Goals | Mark goals complete or blocked |
+| `review_exit` | ✅ Review | Self-check before finishing tasks |
+| `git_commit` | 🔀 Git | Stage and commit changes |
+| `validate_changes` | ✅ Validation | Run tests, lint, build |
+| `list_git_changes` | 📊 Git | View status, log, diff, branch |
+
+### Goal / Objective System
+- `create_goal` with token budgets via API
+- `update_goal` tool marks complete/blocked
+- Continuation prompts with token usage tracking
+- Active goal display on dashboard
+
+### Planning
+- Plan tracking with pending/in-progress/completed steps
+- Visual sidebar display
+- Auto-updates as the agent works
+
+### AGENTS.md
+- Loads project instructions from AGENTS.md files in CWD and parents
+- Scoped instructions for subdirectories
+- Precedence rules (deepest wins)
+
+### Skills
+- Discovers `.shellagent/skills/*.md` files
+- Task-specific knowledge injection
+- Loaded from user home and project directories
+
+### Context Management
+- Auto-compaction when conversation exceeds token limits
+- Summarizes old messages while keeping recent context
+- Continuation prompts for long-running goals
+
+### Command Safety
+- Blocks dangerous commands (rm -rf /, dd, mkfs, fork bombs, etc.)
+- Self-kill protection — pkill -f won't kill ShellAgent
+- Server auto-detection — `python3 -m http.server`, `flask run`, etc. backgrounded
+
+### Session Management
+- Auto-saved to `~/.shellagent/sessions/`
+- Conversation history panel with search
+- Session archive/unarchive
+- Session delete
+- Load from disk on reconnect
+- Session export as JSON download
+
+### Conversation Panel
+- Browse past conversations
+- Search by text or session ID
+- Archive/delete conversations
+- Click to reload any session
+- Message count and timestamp display
+- Export conversations as JSON
+
+### Streaming UI
+- Real-time token-by-token output via SSE
+- Tool call blocks with status (running/success/failed)
+- Iteration counter
+- Token usage display
+- Auto-scroll with manual override
+
+### Plan Tracking
+- Visual plan sidebar
+- Step-by-step progress
+- Status icons (○ pending, ◐ in-progress, ● completed)
+
+### Provider Support
+- **OpenAI** — GPT-4o family with full tool calling
+- **NVIDIA NIM** — Llama, Nemotron, Mistral, CodeStral, Gemma with tool calling
+- **Ollama** — local/remote models with tool calling support
+- Custom model input — set any model name in the web UI
+
+### Error Recovery
+- Auto-retry with exponential backoff (3 attempts)
+- Error diagnostics with API error body reading
+- Graceful handling of broken pipes and connection resets
+- Timeout handling with process group kill
+
+### Security
+- API secret authentication
+- Rate limiting (60 req/min per IP)
+- Command safety validation
+- Self-kill prevention
+- Request body size limits
+- CORS headers for browser access
+
+### Performance
+- Zero dependencies — pure Python 3.8+ stdlib
+- 32-bit and 64-bit support
+- Gzip compression for static assets
+- Thread safety with locking
+- Session persistence with JSON serialization
+
+### UI Features
+- Dark theme with custom design
+- Code block syntax highlighting
+- Copy buttons for code and messages
+- Markdown rendering
+- Keyboard shortcuts (/ to focus, Escape to close)
+- Responsive design
+- Accessible with ARIA labels
+- Loading dots, tool call animations
 
 ## Installation (32-bit & 64-bit)
 
@@ -28,79 +154,26 @@ python3 app.py
 ./setup.sh
 ```
 
-### Running on 32-bit ARM (Android phone, Raspberry Pi, etc.)
+### Running on 32-bit ARM (Android phone via Termux, Raspberry Pi)
 ```bash
-# 1. Install Python 3.8+ (use pkg on Termux)
 pkg install python git
-
-# 2. Clone the repo
 git clone https://github.com/tundefund0-gif/shellagent.git
 cd shellagent
-
-# 3. Run directly (no pip, no deps)
 export OPENAI_API_KEY="sk-..."
 python3 app.py
-
-# 4. Open in browser: http://<phone-ip>:8765
+# Open http://<phone-ip>:8765
 ```
 
-### Git pull on 32-bit phone (divergent branches)
+### Git pull (divergent branches fix)
 ```bash
-# If you get: "Your local changes would be overwritten by merge"
+# Local changes blocking pull
 git stash
 git pull
 git stash pop
 
-# If you get: "divergent branches"
+# Divergent branches
 git pull --rebase
 ```
-
-## Features
-
-### 12 Tools
-| Tool | Category | What it does |
-|---|---|---|
-| `execute_shell_command` | ⚡ Shell | Run any shell command (auto-retry up to 3x) |
-| `web_search` | 🔍 Web | Search via DuckDuckGo |
-| `web_fetch` | 🌐 Web | Fetch and read any URL |
-| `read_file` | 📖 Files | Read files with line numbers |
-| `write_file` | ✏️ Files | Create or overwrite files (auto-creates dirs) |
-| `list_directory` | 📁 Files | Explore directory structure |
-| `grep_search` | 🔎 Search | Regex search across files (uses ripgrep when available) |
-| `analyze_code` | 🔬 Analysis | Count lines, find functions/classes, identify imports |
-| `update_plan` | 📋 Planning | Track task steps with pending/in-progress/completed |
-| `git_commit` | 🔀 Git | Stage and commit changes |
-| `validate_changes` | ✅ Validation | Run tests, lint, build |
-| `list_git_changes` | 📊 Git | View status, log, diff, branch |
-
-### v7.3 New Features
-- **Process tracking & kill button** — stop stuck commands from the dashboard
-- **Conversation history panel** — browse past sessions, search, load, delete
-- **Custom NVIDIA model input** — set any NVIDIA NIM model in the web UI
-- **Session export** — download conversations as JSON
-- **Auto-cancellation** — kill cleanly stops the agent loop
-- **Robust error handling** — no more hanging after iteration 1
-
-### Full Codex-Style Features
-- **AGENTS.md** — loads project instructions from AGENTS.md files in CWD and parents
-- **Skills loading** — discovers `.shellagent/skills/*.md` files for task-specific knowledge
-- **Plan tracking** — sidebar shows task plan with step-by-step progress
-- **Session persistence** — conversations auto-saved to `~/.shellagent/sessions/`
-- **Command history** — sidebar shows all tool calls with success/failure
-- **Token tracking** — real-time token usage display
-- **CWD selector** — click the folder icon to change working directory
-- **Self-check** — AI verifies its work before finishing
-- **Preamble** — brief visible update before heavy tool use
-- **Auto-retry** — failed shell commands retry up to 3 times with backoff
-- **No timeout** — commands run until completion (configurable, default 3600s)
-- **Approval modes** — full-auto, auto-edit, ask
-- **Rate limiting** — 60 requests per minute per IP
-- **Thread safety** — concurrent users with lock-based session store
-- **Graceful shutdown** — SIGINT/SIGTERM handled cleanly
-- **Streaming UI** — real-time token-by-token output
-- **Tool call display** — collapsible tool call blocks with status
-- **Copy buttons** — copy code blocks and messages
-- **Keyboard shortcuts** — / to focus, Escape to close
 
 ## Configuration
 
@@ -110,93 +183,48 @@ git pull --rebase
 | `SHELLAGENT_HOST` | `0.0.0.0` | Bind address |
 | `SHELLAGENT_CMD_TIMEOUT` | `3600` | Per-command timeout (seconds) |
 | `SHELLAGENT_MAX_ITERS` | `50` | Max agentic loop iterations |
-| `SHELLAGENT_MAX_RETRIES` | `3` | Auto-retry count for failed commands |
-| `SHELLAGENT_APPROVAL` | `full-auto` | Approval mode: full-auto, auto-edit, ask |
-| `SHELLAGENT_CWD` | cwd | Working directory for commands |
-| `SHELLAGENT_SESSIONS` | `~/.shellagent/sessions` | Session storage path |
+| `SHELLAGENT_MAX_RETRIES` | `3` | Auto-retry count |
+| `SHELLAGENT_APPROVAL` | `full-auto` | Approval mode |
+| `SHELLAGENT_CWD` | cwd | Working directory |
+| `SHELLAGENT_SESSIONS` | `~/.shellagent/sessions` | Session storage |
 | `SHELLAGENT_PROVIDER` | `openai` | Default provider |
-| `SHELLAGENT_MODEL` | (provider default) | Default model override |
-| `SHELLAGENT_SECRET` | (random) | API authentication secret |
-
-## Supported Providers
-
-### OpenAI
-Uses the `gpt-4o` family. Models: gpt-4o, gpt-4o-mini, gpt-4.1, gpt-4.1-mini, gpt-4.1-nano, o3, o3-mini, o4-mini.
-
-Set `OPENAI_API_KEY` and the agent gets full tool calling support.
-
-### NVIDIA NIM
-Access NVIDIA's hosted models via `https://integrate.api.nvidia.com/v1/chat/completions`. Supports tool calling.
-
-Set `NVIDIA_API_KEY`. Models include Llama 3.3, Nemotron, Mistral, CodeStral, and Gemma.
-
-**Custom NVIDIA model**: Click the provider dropdown → NVIDIA → select "Custom model" → enter any model name.
-
-### Ollama (Local)
-Runs models locally. Set `OLLAMA_HOST` (default: `http://localhost:11434`). No API key needed.
-
-```bash
-ollama pull llama3.2
-export OLLAMA_HOST=http://localhost:11434
-python3 app.py
-```
-
-## How It Works
-
-```
-User: "Search for Docker best practices and create a Dockerfile"
-
-Agent:
-  1. 📋 update_plan — outline steps
-  2. 🔍 web_search — "Docker best practices 2026"
-  3. 🌐 web_fetch — read the top article
-  4. 📖 read_file — check if Dockerfile exists
-  5. ✏️ write_file — create optimized Dockerfile
-  6. 🔎 grep_search — verify patterns in the file
-  7. 🔬 analyze_code — check file structure
-  8. ✅ validate_changes — run hadolint
-  9. 🔀 git_commit — "Add Dockerfile with best practices"
-  10. 📋 update_plan — mark steps complete
-  11. ✓ Summary with all changes
-```
-
-## Keyboard Shortcuts
-
-- **Enter** — Send message
-- **Shift+Enter** — Newline in input
-- **/** — Focus input (when not focused)
-- **Escape** — Close dropdowns / panels
+| `SHELLAGENT_MODEL` | (default) | Default model override |
+| `SHELLAGENT_SECRET` | (random) | API authentication |
 
 ## API Endpoints
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/` | Web dashboard |
-| `GET` | `/health` | Health check with uptime, tools, provider status |
-| `GET` | `/api/providers` | List available providers and models |
-| `GET` | `/api/cwd` | Current working directory |
+| `GET` | `/health` | Health check |
+| `GET` | `/api/providers` | List providers/models |
+| `GET` | `/api/cwd` | Get working directory |
 | `POST` | `/api/cwd` | Change working directory |
-| `POST` | `/api/chat` | Send chat message (SSE streaming response) |
-| `GET` | `/api/sessions` | List active sessions |
-| `POST` | `/api/sessions/load` | Load a saved session |
+| `POST` | `/api/chat` | Send message (SSE stream) |
+| `GET` | `/api/sessions` | List sessions |
+| `POST` | `/api/sessions/load` | Load a session |
 | `POST` | `/api/sessions/delete` | Delete a session |
-| `POST` | `/api/sessions/clear` | Clear messages in a session |
-| `GET` | `/api/audit` | Recent tool call audit log |
-| `POST` | `/api/kill` | Kill a running task by session_id |
-| `GET` | `/api/export` | Export session as JSON download |
+| `POST` | `/api/sessions/archive` | Archive a session |
+| `POST` | `/api/sessions/unarchive` | Unarchive a session |
+| `POST` | `/api/sessions/clear` | Clear session messages |
+| `POST` | `/api/goal` | Get/set active goal |
+| `GET` | `/api/audit` | Tool call audit log |
+| `POST` | `/api/kill` | Kill running task |
+| `GET` | `/api/export` | Export session as JSON |
+| `POST` | `/api/custom_model` | Set custom model |
 
 ## Architecture
 
 ```
 shellagent/
-├── app.py              # 12 tools + agentic loop + web server (~1700 lines)
+├── app.py              # Full agent (~2000 lines)
 ├── setup.sh            # One-click launcher
 ├── AGENTS.md           # Project instructions
 ├── templates/
-│   └── index.html      # Dashboard with conversation panel
+│   └── index.html      # Dashboard with all panels
 ├── static/
-│   ├── css/style.css   # Dark theme
-│   └── js/app.js       # Streaming, plan, sessions, tool display
+│   ├── css/style.css   # Dark theme with v7.4 additions
+│   └── js/app.js       # Full frontend with streaming, goals, archives
 ├── requirements.txt    # No dependencies
 ├── LICENSE
 └── README.md
@@ -204,7 +232,7 @@ shellagent/
 
 ## Zero Dependencies
 
-Pure Python 3.8+ stdlib. No pip install needed. Runs on 32-bit ARM (Termux, Raspberry Pi) and 64-bit systems.
+Pure Python 3.8+ stdlib. No pip install. Runs on 32-bit ARM (Termux, Raspberry Pi) and 64-bit systems. Single-file backend (~2000 lines).
 
 ## License
 

@@ -1,10 +1,10 @@
 #!/bin/bash
-# ShellAgent v7.3 — One-click launcher
+# ShellAgent v7.4 — One-click launcher
 set -e
 
 cd "$(dirname "$0")"
 
-echo "⚡ ShellAgent v7.3"
+echo "⚡ ShellAgent v7.4"
 echo ""
 
 # Check Python
