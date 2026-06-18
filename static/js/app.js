@@ -1,5 +1,4 @@
 let chatHistory = [];
-let autoExecute = true;
 let isStreaming = false;
 let currentProvider = 'openai';
 let currentModel = '';
@@ -12,13 +11,13 @@ const userInput = document.getElementById('userInput');
 const sendBtn = document.getElementById('sendBtn');
 const modelDropdown = document.getElementById('modelDropdown');
 const statusDot = document.getElementById('statusDot');
+const iterBadge = document.getElementById('iterBadge');
+const iterText = document.getElementById('iterText');
 
-// ─── Init ─────────────────────────────────────────────────────────────
 async function init() {
   try {
     const resp = await fetch('/api/providers');
     providerModels = await resp.json();
-    // Set first available model
     for (const [pid, info] of Object.entries(providerModels)) {
       if (info.models.length > 0) {
         currentProvider = pid;
@@ -43,14 +42,13 @@ function setProvider(pid) {
 }
 
 function updateProviderUI() {
-  // Update tabs
   document.querySelectorAll('.provider-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.provider === currentProvider);
   });
-  // Update model display
   document.getElementById('currentModel').textContent = currentModel || 'none';
   const pName = providerModels[currentProvider]?.name || currentProvider;
-  document.getElementById('providerInfo').textContent = `${pName} · ${currentModel}`;
+  const tools = providerModels[currentProvider]?.supports_tools;
+  document.getElementById('providerInfo').textContent = `${pName} · ${currentModel} · ${tools ? 'tool calling' : 'code blocks'}`;
 }
 
 function toggleModelDropdown() {
@@ -58,21 +56,19 @@ function toggleModelDropdown() {
     modelDropdown.classList.remove('show');
     return;
   }
-  // Position dropdown
   const rect = document.getElementById('modelSelector').getBoundingClientRect();
   modelDropdown.style.top = (rect.bottom + 4) + 'px';
   modelDropdown.style.left = Math.max(10, rect.left + rect.width / 2 - 140) + 'px';
 
   let html = '';
   for (const [pid, info] of Object.entries(providerModels)) {
-    html += `<div class="dd-section">${info.name}</div>`;
+    html += `<div class="dd-section">${info.name}${info.supports_tools ? ' ⚡' : ''}</div>`;
     if (info.models.length === 0) {
-      html += `<div class="dd-item" style="color:var(--text4);cursor:default">No models available</div>`;
+      html += `<div class="dd-item" style="color:var(--text4);cursor:default">No models found</div>`;
     }
     for (const m of info.models) {
       const sel = pid === currentProvider && m === currentModel ? ' selected' : '';
-      html += `<div class="dd-item${sel}" onclick="pickModel('${pid}','${escapeAttr(m)}')">
-        <span class="dd-dot ${pid}"></span>${escapeHtml(m)}</div>`;
+      html += `<div class="dd-item${sel}" onclick="pickModel('${pid}','${esc(m)}')"><span class="dd-dot ${pid}"></span>${h(m)}</div>`;
     }
   }
   modelDropdown.innerHTML = html;
@@ -86,142 +82,123 @@ function pickModel(pid, model) {
   updateProviderUI();
 }
 
-function escapeAttr(s) {
-  return s.replace(/'/g, "\\'").replace(/"/g, '&quot;');
-}
-
-document.addEventListener('click', (e) => {
-  if (!e.target.closest('.model-selector') && !e.target.closest('.model-dropdown')) {
+document.addEventListener('click', e => {
+  if (!e.target.closest('.model-selector') && !e.target.closest('.model-dropdown'))
     modelDropdown.classList.remove('show');
-  }
 });
 
-// ─── Auto-execute ─────────────────────────────────────────────────────
-function setAutoExec(val) {
-  autoExecute = val;
-  document.getElementById('autoMode').classList.toggle('active', val);
-  document.getElementById('manualMode').classList.toggle('active', !val);
-  document.getElementById('autoExecBadge').textContent = `Auto-execute: ${val ? 'ON' : 'OFF'}`;
-  document.getElementById('autoExecBadge').style.color = val ? 'var(--green)' : 'var(--text4)';
-}
-
 // ─── Input ────────────────────────────────────────────────────────────
-function sendQuick(text) {
-  userInput.value = text;
-  sendMessage();
-}
-
-function handleKey(e) {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    sendMessage();
-  }
-}
-
+function sendQuick(text) { userInput.value = text; sendMessage(); }
+function handleKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }
 userInput.addEventListener('input', () => {
   userInput.style.height = 'auto';
   userInput.style.height = Math.min(userInput.scrollHeight, 150) + 'px';
 });
 
-// ─── Escape / Markdown ────────────────────────────────────────────────
-function escapeHtml(t) {
-  const d = document.createElement('div');
-  d.textContent = t;
-  return d.innerHTML;
-}
+// ─── HTML helpers ─────────────────────────────────────────────────────
+function h(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+function esc(s) { return s.replace(/'/g, "\\'").replace(/"/g, '&quot;'); }
 
-function renderMarkdown(text) {
-  let h = escapeHtml(text);
-  // Code blocks
-  h = h.replace(/```(\w*)\n([\s\S]*?)```/g, (m, lang, code) => {
+function renderMd(text) {
+  let html = h(text);
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (m, lang, code) => {
     const label = lang ? `<span class="lang-label">${lang}</span>` : '';
     return `<pre>${label}${code}</pre>`;
   });
-  // Inline code
-  h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
-  // Bold
-  h = h.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  // Italic
-  h = h.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-  // Headers
-  h = h.replace(/^### (.+)$/gm, '<strong style="font-size:15px">$1</strong>');
-  h = h.replace(/^## (.+)$/gm, '<strong style="font-size:16px">$1</strong>');
-  h = h.replace(/^# (.+)$/gm, '<strong style="font-size:18px">$1</strong>');
-  // Lists
-  h = h.replace(/^- (.+)$/gm, '• $1');
-  // Paragraphs
-  h = h.split('\n\n').map(p => {
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  html = html.replace(/^### (.+)$/gm, '<strong style="font-size:14px">$1</strong>');
+  html = html.replace(/^## (.+)$/gm, '<strong style="font-size:15px">$1</strong>');
+  html = html.replace(/^# (.+)$/gm, '<strong style="font-size:17px">$1</strong>');
+  html = html.replace(/^- (.+)$/gm, '• $1');
+  html = html.split('\n\n').map(p => {
     if (p.includes('<pre>')) return p;
     return `<p>${p.replace(/\n/g, '<br>')}</p>`;
   }).join('');
-  return h;
+  return html;
 }
 
 // ─── Messages ─────────────────────────────────────────────────────────
-function addMessage(role, content, streaming = false) {
+function addMsg(role, content, stream = false) {
   welcomeEl.style.display = 'none';
   const div = document.createElement('div');
   div.className = 'message';
-  const ac = role === 'user' ? 'user' : role === 'system' ? 'system' : 'agent';
-  const nc = role === 'user' ? 'user-name' : role === 'system' ? 'system-name' : 'agent-name';
-  const label = role === 'user' ? 'You' : role === 'system' ? 'System' : 'ShellAgent';
-  const initial = role === 'user' ? 'Y' : role === 'system' ? '⚡' : 'S';
-  div.innerHTML = `
-    <div class="msg-avatar ${ac}">${initial}</div>
+  const ac = role === 'user' ? 'user' : 'agent';
+  const nc = role === 'user' ? 'user-name' : 'agent-name';
+  const label = role === 'user' ? 'You' : 'ShellAgent';
+  const init = role === 'user' ? 'Y' : 'S';
+  div.innerHTML = `<div class="msg-avatar ${ac}">${init}</div>
     <div class="msg-body">
       <div class="msg-name ${nc}">${label}</div>
-      <div class="msg-content">${streaming ? '<span class="cursor"></span>' : renderMarkdown(content)}</div>
+      <div class="msg-content">${stream ? '<span class="cursor"></span>' : renderMd(content)}</div>
     </div>`;
   messagesEl.appendChild(div);
-  chatArea.scrollTop = chatArea.scrollHeight;
+  scroll();
   return div;
 }
 
-function addCommandOutput(cmd, output) {
-  const wrapper = document.createElement('div');
-  wrapper.className = 'cmd-output running';
-  wrapper.innerHTML = `
-    <div class="cmd-output-header">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-      <span>$ ${escapeHtml(cmd.trim())}</span>
-    </div>
-    <div class="cmd-output-body">${escapeHtml(output)}</div>`;
-  const lastMsg = messagesEl.querySelector('.message:last-child .msg-body');
-  if (lastMsg) lastMsg.appendChild(wrapper);
-  chatArea.scrollTop = chatArea.scrollHeight;
-  return wrapper;
-}
-
-function updateCommandOutput(wrapper, output) {
-  wrapper.classList.remove('running');
-  const body = wrapper.querySelector('.cmd-output-body');
-  if (body) body.textContent = output;
-}
-
-function addSummary(text) {
+function addToolCall(id, command) {
   const div = document.createElement('div');
-  div.className = 'summary-block';
-  div.innerHTML = renderMarkdown(text);
+  div.className = 'tool-call';
+  div.id = `tc-${id}`;
+  div.innerHTML = `
+    <div class="tool-header running">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+      <span class="tool-cmd">$ ${h(command)}</span>
+      <span class="tool-badge running">running</span>
+    </div>
+    <div class="tool-output">⏳ Executing...</div>`;
   const lastMsg = messagesEl.querySelector('.message:last-child .msg-body');
   if (lastMsg) lastMsg.appendChild(div);
-  chatArea.scrollTop = chatArea.scrollHeight;
+  scroll();
+  return div;
 }
 
-// ─── Send Message ─────────────────────────────────────────────────────
+function updateToolResult(id, output, success, exitCode) {
+  const el = document.getElementById(`tc-${id}`);
+  if (!el) return;
+  const header = el.querySelector('.tool-header');
+  const badge = el.querySelector('.tool-badge');
+  const outEl = el.querySelector('.tool-output');
+  header.classList.remove('running');
+  header.classList.add(success ? 'success' : 'failed');
+  badge.className = `tool-badge ${success ? 'success' : 'failed'}`;
+  badge.textContent = success ? 'done' : 'failed';
+  if (exitCode !== undefined) {
+    const ec = document.createElement('span');
+    ec.className = `exit-code ${success ? 'exit-ok' : 'exit-fail'}`;
+    ec.textContent = `exit ${exitCode}`;
+    badge.parentNode.appendChild(ec);
+  }
+  outEl.textContent = output;
+  scroll();
+}
+
+function addIterSep(num) {
+  const div = document.createElement('div');
+  div.className = 'iter-sep';
+  div.textContent = `iteration ${num}`;
+  messagesEl.appendChild(div);
+  scroll();
+}
+
+function scroll() { chatArea.scrollTop = chatArea.scrollHeight; }
+
+// ─── Main send ────────────────────────────────────────────────────────
 async function sendMessage() {
   const text = userInput.value.trim();
   if (!text || isStreaming) return;
-
   userInput.value = '';
   userInput.style.height = 'auto';
   isStreaming = true;
   sendBtn.disabled = true;
-  statusDot.className = 'status-dot';
+  statusDot.className = 'status-dot running';
 
-  addMessage('user', text);
+  addMsg('user', text);
   chatHistory.push({ role: 'user', content: text });
 
-  const agentDiv = addMessage('assistant', '', true);
+  const agentDiv = addMsg('assistant', '', true);
   const contentEl = agentDiv.querySelector('.msg-content');
   let fullText = '';
 
@@ -229,103 +206,80 @@ async function sendMessage() {
     const resp = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messages: chatHistory,
-        provider: currentProvider,
-        model: currentModel,
-        auto_execute: autoExecute
-      })
+      body: JSON.stringify({ messages: chatHistory, provider: currentProvider, model: currentModel })
     });
 
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = '';
-    let currentWrapper = null;
+    let buf = '';
+    let currentToolId = null;
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      buf += decoder.decode(value, { stream: true });
 
-      const events = buffer.split('\n\n');
-      buffer = events.pop() || '';
+      const events = buf.split('\n\n');
+      buf = events.pop() || '';
 
-      for (const event of events) {
-        const lines = event.split('\n');
-        let eventType = '';
-        let data = '';
-        for (const line of lines) {
+      for (const ev of events) {
+        let eventType = '', data = '';
+        for (const line of ev.split('\n')) {
           if (line.startsWith('event: ')) eventType = line.slice(7);
           if (line.startsWith('data: ')) data = line.slice(6);
         }
         if (!data) continue;
 
         try {
-          const parsed = JSON.parse(data);
-
-          switch (parsed.type) {
+          const p = JSON.parse(data);
+          switch (p.type) {
+            case 'iteration':
+              addIterSep(p.data);
+              iterBadge.style.display = 'flex';
+              iterText.textContent = p.data;
+              break;
             case 'token':
-              fullText += parsed.data;
-              contentEl.innerHTML = renderMarkdown(fullText) + '<span class="cursor"></span>';
-              chatArea.scrollTop = chatArea.scrollHeight;
+              fullText += p.data;
+              contentEl.innerHTML = renderMd(fullText) + '<span class="cursor"></span>';
+              scroll();
               break;
-
             case 'done':
-              contentEl.innerHTML = renderMarkdown(fullText);
+              contentEl.innerHTML = renderMd(p.data || fullText);
+              chatHistory.push({ role: 'assistant', content: p.data || fullText });
               break;
-
-            case 'executing':
-              currentWrapper = addCommandOutput(parsed.data, '⏳ Running...');
+            case 'tool_call':
+              const tc = typeof p.data === 'string' ? JSON.parse(p.data) : p.data;
+              currentToolId = tc.id || `tc-${Date.now()}`;
+              addToolCall(currentToolId, tc.command || '');
               break;
-
-            case 'output':
-              if (currentWrapper) {
-                updateCommandOutput(currentWrapper, parsed.data);
-                currentWrapper = null;
-              }
+            case 'tool_result': {
+              const tr = typeof p.data === 'string' ? JSON.parse(p.data) : p.data;
+              updateToolResult(tr.id || currentToolId, tr.output || '', tr.success, tr.exit_code);
               break;
-
-            case 'summary_token':
-              if (!document.querySelector('.summary-block')) {
-                addSummary('');
-              }
-              const sb = document.querySelector('.summary-block:last-child');
-              if (sb) {
-                sb.innerHTML = renderMarkdown(
-                  (sb.textContent || '') + parsed.data
-                );
-              }
-              break;
-
-            case 'summary_done':
-              const sbFinal = document.querySelector('.summary-block:last-child');
-              if (sbFinal) sbFinal.innerHTML = renderMarkdown(parsed.data);
-              break;
-
+            }
             case 'error':
               statusDot.className = 'status-dot error';
-              fullText += `\n\n⚠️ ${parsed.data}`;
-              contentEl.innerHTML = renderMarkdown(fullText);
+              fullText += `\n\n⚠️ ${p.data}`;
+              contentEl.innerHTML = renderMd(fullText);
               break;
           }
         } catch (e) {}
       }
     }
 
-    // Ensure cursor is removed
-    contentEl.innerHTML = renderMarkdown(fullText);
-    chatHistory.push({ role: 'assistant', content: fullText });
+    if (!fullText) contentEl.innerHTML = renderMd('');
 
   } catch (e) {
     statusDot.className = 'status-dot error';
-    contentEl.innerHTML = renderMarkdown(`⚠️ Connection error: ${e.message}`);
+    contentEl.innerHTML = renderMd(`⚠️ Connection error: ${e.message}`);
   }
 
   isStreaming = false;
   sendBtn.disabled = false;
-  chatArea.scrollTop = chatArea.scrollHeight;
+  statusDot.className = 'status-dot';
+  iterBadge.style.display = 'none';
+  scroll();
   userInput.focus();
 }
 
-// ─── Boot ─────────────────────────────────────────────────────────────
 init();

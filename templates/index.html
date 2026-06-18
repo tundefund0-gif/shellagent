@@ -13,17 +13,15 @@
       <div class="logo">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
         <span>ShellAgent</span>
-        <span class="version">v2.0</span>
+        <span class="version">v3.0</span>
       </div>
     </div>
     <div class="topbar-center">
-      <!-- Provider selector -->
       <div class="provider-selector" id="providerSelector">
         <div class="provider-btn active" data-provider="openai" onclick="setProvider('openai')">OpenAI</div>
         <div class="provider-btn" data-provider="nvidia" onclick="setProvider('nvidia')">NVIDIA</div>
         <div class="provider-btn" data-provider="ollama" onclick="setProvider('ollama')">Ollama</div>
       </div>
-      <!-- Model selector -->
       <div class="model-selector" id="modelSelector" onclick="toggleModelDropdown()">
         <span id="currentModel">gpt-4o</span>
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
@@ -31,11 +29,11 @@
       <div class="model-dropdown" id="modelDropdown"></div>
     </div>
     <div class="topbar-right">
-      <div class="status-dot" id="statusDot" title="Connected"></div>
-      <div class="mode-toggle">
-        <button class="mode-btn active" id="autoMode" onclick="setAutoExec(true)">Auto</button>
-        <button class="mode-btn" id="manualMode" onclick="setAutoExec(false)">Manual</button>
+      <div class="iter-badge" id="iterBadge" style="display:none">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        <span id="iterText">1</span>
       </div>
+      <div class="status-dot" id="statusDot" title="Ready"></div>
     </div>
   </header>
 
@@ -45,15 +43,15 @@
         <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
       </div>
       <h1>ShellAgent</h1>
-      <p class="welcome-sub">AI shell agent · Runs commands autonomously · No confirmation needed</p>
-      <div class="provider-info" id="providerInfo">OpenAI · gpt-4o</div>
+      <p class="welcome-sub">Agentic AI shell agent · Tool calling · Auto-retry on failure · No timeout</p>
+      <div class="provider-info" id="providerInfo">OpenAI · gpt-4o · tool calling</div>
       <div class="quick-actions">
-        <button class="quick-btn" onclick="sendQuick('Show me full system information (OS, CPU, memory, disk)')">🖥 System Info</button>
-        <button class="quick-btn" onclick="sendQuick('List all files in current directory with details')">📁 List Files</button>
-        <button class="quick-btn" onclick="sendQuick('Show disk usage for all mounted filesystems')">💾 Disk Usage</button>
-        <button class="quick-btn" onclick="sendQuick('Show top 20 processes sorted by CPU usage')">⚙ Processes</button>
-        <button class="quick-btn" onclick="sendQuick('Show network interfaces and IP addresses')">🌐 Network</button>
-        <button class="quick-btn" onclick="sendQuick('Check and install any pending system updates')">🔄 Updates</button>
+        <button class="quick-btn" onclick="sendQuick('Show full system info: OS, CPU, memory, disk, network')">🖥 System Info</button>
+        <button class="quick-btn" onclick="sendQuick('List all files in current directory with sizes and permissions')">📁 Files</button>
+        <button class="quick-btn" onclick="sendQuick('Check disk usage across all drives')">💾 Disk</button>
+        <button class="quick-btn" onclick="sendQuick('Show top 20 processes by CPU and memory usage')">⚙ Processes</button>
+        <button class="quick-btn" onclick="sendQuick('Show all network interfaces, IPs, and active connections')">🌐 Network</button>
+        <button class="quick-btn" onclick="sendQuick('Find and install any pending system updates')">🔄 Update</button>
       </div>
     </div>
     <div id="messages"></div>
@@ -62,7 +60,7 @@
   <footer class="input-area">
     <div class="input-wrap">
       <div class="input-prefix">❯</div>
-      <textarea id="userInput" placeholder="Type a command or ask anything..." rows="1" onkeydown="handleKey(event)"></textarea>
+      <textarea id="userInput" placeholder="Describe what you want to do..." rows="1" onkeydown="handleKey(event)"></textarea>
       <button class="send-btn" id="sendBtn" onclick="sendMessage()">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
       </button>
@@ -70,7 +68,9 @@
     <div class="input-hint">
       <span>Enter to send</span>
       <span>·</span>
-      <span id="autoExecBadge">Auto-execute: ON</span>
+      <span class="hint-tool">🔧 tool calling</span>
+      <span>·</span>
+      <span class="hint-retry">🔄 auto-retry</span>
     </div>
   </footer>
 </div>
