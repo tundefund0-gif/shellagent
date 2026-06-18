@@ -569,6 +569,31 @@ def execute_shell_command(command, working_directory=None):
     cwd = working_directory or CWD
     retries = 0
     last_output = ""
+    # Safety: intercept pkill -f to prevent killing our own process
+    if "pkill" in command and "-f" in command:
+        import re as _re2
+        pm = _re2.search(r'pkill\s+(-[a-zA-Z]*f[a-zA-Z]*)\s+(.+)', command)
+        if pm:
+            my_pid = os.getpid()
+            pat = pm.group(2).strip().rstrip(";|&")
+            killed = 0
+            import os as _os2
+            for p in _os2.listdir("/proc"):
+                if not p.isdigit():
+                    continue
+                pid = int(p)
+                if pid == my_pid:
+                    continue
+                try:
+                    with open("/proc/" + p + "/cmdline") as _f:
+                        cmdline = _f.read()
+                    if pat in cmdline:
+                        _os2.kill(pid, 15)
+                        killed += 1
+                except (OSError, IOError, PermissionError):
+                    pass
+            safe_output = "[safely killed %d process(es) matching '%s']" % (killed, pat)
+            return {"output": safe_output, "success": True, "exit_code": 0, "retries": 0}
     for attempt in range(MAX_RETRIES):
         try:
             r = subprocess.run(
