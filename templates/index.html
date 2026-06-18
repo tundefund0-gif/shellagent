@@ -13,22 +13,27 @@
       <div class="logo">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
         <span>ShellAgent</span>
+        <span class="version">v2.0</span>
       </div>
     </div>
     <div class="topbar-center">
+      <!-- Provider selector -->
+      <div class="provider-selector" id="providerSelector">
+        <div class="provider-btn active" data-provider="openai" onclick="setProvider('openai')">OpenAI</div>
+        <div class="provider-btn" data-provider="nvidia" onclick="setProvider('nvidia')">NVIDIA</div>
+        <div class="provider-btn" data-provider="ollama" onclick="setProvider('ollama')">Ollama</div>
+      </div>
+      <!-- Model selector -->
       <div class="model-selector" id="modelSelector" onclick="toggleModelDropdown()">
         <span id="currentModel">gpt-4o</span>
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
       </div>
-      <div class="model-dropdown" id="modelDropdown">
-        <div class="dropdown-item" onclick="setModel('gpt-4o')">gpt-4o</div>
-        <div class="dropdown-item" onclick="setModel('gpt-4o-mini')">gpt-4o-mini</div>
-        <div class="dropdown-item" onclick="setModel('o3-mini')">o3-mini</div>
-      </div>
+      <div class="model-dropdown" id="modelDropdown"></div>
     </div>
     <div class="topbar-right">
+      <div class="status-dot" id="statusDot" title="Connected"></div>
       <div class="mode-toggle">
-        <button class="mode-btn active" id="autoMode" onclick="setAutoExec(true)">Auto-execute</button>
+        <button class="mode-btn active" id="autoMode" onclick="setAutoExec(true)">Auto</button>
         <button class="mode-btn" id="manualMode" onclick="setAutoExec(false)">Manual</button>
       </div>
     </div>
@@ -37,15 +42,18 @@
   <main class="chat-area" id="chatArea">
     <div class="welcome" id="welcome">
       <div class="welcome-icon">
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+        <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
       </div>
       <h1>ShellAgent</h1>
-      <p>AI-powered shell commands. Ask anything.</p>
+      <p class="welcome-sub">AI shell agent · Runs commands autonomously · No confirmation needed</p>
+      <div class="provider-info" id="providerInfo">OpenAI · gpt-4o</div>
       <div class="quick-actions">
-        <button class="quick-btn" onclick="sendQuick('Show system information')">System Info</button>
-        <button class="quick-btn" onclick="sendQuick('List files in current directory')">List Files</button>
-        <button class="quick-btn" onclick="sendQuick('Check disk usage')">Disk Usage</button>
-        <button class="quick-btn" onclick="sendQuick('Show running processes')">Processes</button>
+        <button class="quick-btn" onclick="sendQuick('Show me full system information (OS, CPU, memory, disk)')">🖥 System Info</button>
+        <button class="quick-btn" onclick="sendQuick('List all files in current directory with details')">📁 List Files</button>
+        <button class="quick-btn" onclick="sendQuick('Show disk usage for all mounted filesystems')">💾 Disk Usage</button>
+        <button class="quick-btn" onclick="sendQuick('Show top 20 processes sorted by CPU usage')">⚙ Processes</button>
+        <button class="quick-btn" onclick="sendQuick('Show network interfaces and IP addresses')">🌐 Network</button>
+        <button class="quick-btn" onclick="sendQuick('Check and install any pending system updates')">🔄 Updates</button>
       </div>
     </div>
     <div id="messages"></div>
@@ -53,12 +61,17 @@
 
   <footer class="input-area">
     <div class="input-wrap">
-      <textarea id="userInput" placeholder="Type a message..." rows="1" onkeydown="handleKey(event)"></textarea>
+      <div class="input-prefix">❯</div>
+      <textarea id="userInput" placeholder="Type a command or ask anything..." rows="1" onkeydown="handleKey(event)"></textarea>
       <button class="send-btn" id="sendBtn" onclick="sendMessage()">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
       </button>
     </div>
-    <div class="input-hint">Press Enter to send · Shift+Enter for newline</div>
+    <div class="input-hint">
+      <span>Enter to send</span>
+      <span>·</span>
+      <span id="autoExecBadge">Auto-execute: ON</span>
+    </div>
   </footer>
 </div>
 <script src="/static/js/app.js"></script>

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-ShellAgent - Lightweight AI-powered shell command agent with web dashboard.
-Zero external dependencies beyond Python 3.8+ stdlib + requests (for API calls).
-Supports 32-bit and 64-bit systems.
+ShellAgent v2.0 — AI Shell Agent with Multi-Provider Support
+Supports: OpenAI, NVIDIA NIM, Ollama (local + remote)
+Zero external dependencies — Python 3.8+ stdlib only.
+32-bit and 64-bit systems.
 """
 
 import http.server
@@ -11,100 +12,150 @@ import os
 import sys
 import subprocess
 import threading
-import time
 import urllib.request
 import urllib.error
-import uuid
 import signal
-import io
+import re
 
-PORT = int(os.environ.get("SHELLAGENT_PORT", 8765))
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.environ.get("SHELLAGENT_MODEL", "gpt-4o")
-SHELL_TIMEOUT = int(os.environ.get("SHELLAGENT_TIMEOUT", "30"))
-HOST = os.environ.get("SHELLAGENT_HOST", "0.0.0.0")
-CWD = os.environ.get("SHELLAGENT_CWD", os.getcwd())
+# ── Configuration ──────────────────────────────────────────────────────────
+PORT          = int(os.environ.get("SHELLAGENT_PORT", "8765"))
+HOST          = os.environ.get("SHELLAGENT_HOST", "0.0.0.0")
+SHELL_TIMEOUT = int(os.environ.get("SHELLAGENT_TIMEOUT", "60"))
+CWD           = os.environ.get("SHELLAGENT_CWD", os.getcwd())
 
-SYSTEM_PROMPT = """You are ShellAgent, an AI assistant that runs shell commands on the user's machine.
-You can execute any shell command. Always:
-1. Explain what you're about to do
-2. Show the exact command
-3. Explain the output clearly
-When you want to run a command, output it wrapped in ```bash\n...\n``` blocks.
-Always be helpful, concise, and accurate about what commands do.
-If a command could be destructive, warn the user first.
-Operating system info will be provided as context."""
+# Provider keys
+OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
+NVIDIA_API_KEY  = os.environ.get("NVIDIA_API_KEY", "")
+OLLAMA_HOST     = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_API_KEY  = os.environ.get("OLLAMA_API_KEY", "")
 
+# Default provider / model
+DEFAULT_PROVIDER = os.environ.get("SHELLAGENT_PROVIDER", "openai")
+DEFAULT_MODEL    = os.environ.get("SHELLAGENT_MODEL", "")
+
+SYSTEM_PROMPT = """You are ShellAgent, an autonomous AI shell agent running on the user's machine.
+You can execute ANY shell command immediately — no confirmation needed.
+
+Rules:
+1. When you want to run a command, wrap it in ```bash\n...\n``` blocks
+2. You can include multiple code blocks — each will be executed automatically
+3. Always explain what each command does briefly
+4. If a command fails, try to fix it and re-run
+5. You have full shell access — use it confidently
+6. Be concise. Show results. Move on.
+7. For complex tasks, break them into sequential commands
+
+The system will auto-detect commands and run them. No approval needed."""
+
+# ── Provider definitions ───────────────────────────────────────────────────
+PROVIDERS = {
+    "openai": {
+        "name": "OpenAI",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "env_key": "OPENAI_API_KEY",
+        "models": [
+            "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
+            "o3", "o3-mini", "o4-mini",
+        ],
+        "stream_format": "openai",
+        "needs_key": True,
+    },
+    "nvidia": {
+        "name": "NVIDIA NIM",
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "env_key": "NVIDIA_API_KEY",
+        "models": [
+            "meta/llama-3.3-70b-instruct",
+            "meta/llama-3.1-8b-instruct",
+            "meta/llama-3.1-70b-instruct",
+            "nvidia/llama-3.3-nemotron-super-49b-v1",
+            "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+            "mistralai/mistral-large-2-instruct",
+            "mistralai/codestral-2405",
+            "google/gemma-2-27b-it",
+            "deepseek-ai/deepseek-r1",
+        ],
+        "stream_format": "openai",
+        "needs_key": True,
+    },
+    "ollama": {
+        "name": "Ollama",
+        "url": None,  # dynamic
+        "env_key": "OLLAMA_API_KEY",
+        "models": [],  # discovered at runtime
+        "stream_format": "ollama",
+        "needs_key": False,
+    },
+}
+
+# ── Helpers ────────────────────────────────────────────────────────────────
 
 def get_system_context():
-    ctx = f"Working directory: {CWD}\n"
-    try:
-        ctx += f"OS: {sys.platform}\n"
-        ctx += f"Python: {sys.version}\n"
-        r = subprocess.run(["uname", "-a"], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            ctx += f"System: {r.stdout.strip()}\n"
-    except Exception:
-        pass
-    try:
-        r = subprocess.run(["df", "-h", "/"], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            lines = r.stdout.strip().split("\n")
-            if len(lines) > 1:
-                parts = lines[1].split()
-                if len(parts) >= 4:
-                    ctx += f"Disk: {parts[2]} used / {parts[1]} total ({parts[4]} used)\n"
-    except Exception:
-        pass
-    try:
-        r = subprocess.run(["free", "-h"], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            lines = r.stdout.strip().split("\n")
-            if len(lines) > 1:
-                parts = lines[1].split()
-                if len(parts) >= 3:
-                    ctx += f"Memory: {parts[2]} used / {parts[1]} total\n"
-    except Exception:
-        pass
+    ctx = f"Working directory: {CWD}\nOS: {sys.platform}\nPython: {sys.version}\n"
+    for cmd, label in [
+        (["uname", "-a"], "System"),
+        (["df", "-h", "/"], None),
+        (["free", "-h"], None),
+    ]:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                if label:
+                    ctx += f"{label}: {r.stdout.strip()}\n"
+                else:
+                    lines = r.stdout.strip().split("\n")
+                    if len(lines) > 1:
+                        parts = lines[1].split()
+                        if label is None and cmd[0] == "df" and len(parts) >= 4:
+                            ctx += f"Disk: {parts[2]} used / {parts[1]} total ({parts[4]})\n"
+                        elif cmd[0] == "free" and len(parts) >= 3:
+                            ctx += f"Memory: {parts[2]} used / {parts[1]} total\n"
+        except Exception:
+            pass
     return ctx
 
 
-def call_openai_stream(messages):
-    url = "https://api.openai.com/v1/chat/completions"
-    payload = json.dumps({
-        "model": OPENAI_MODEL,
-        "messages": messages,
-        "stream": True,
-        "temperature": 0.2,
-    }).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-    }
-    req = urllib.request.Request(url, data=payload, headers=headers)
-    resp = urllib.request.urlopen(req, timeout=120)
-    return resp
+def get_api_key(provider):
+    info = PROVIDERS.get(provider, {})
+    env = info.get("env_key", "")
+    return os.environ.get(env, "")
+
+
+def get_model(provider, model_override=""):
+    if model_override:
+        return model_override
+    if DEFAULT_MODEL and provider == DEFAULT_PROVIDER:
+        return DEFAULT_MODEL
+    info = PROVIDERS.get(provider, {})
+    models = info.get("models", [])
+    return models[0] if models else ""
+
+
+def get_provider_url(provider):
+    if provider == "ollama":
+        base = OLLAMA_HOST.rstrip("/")
+        return f"{base}/v1/chat/completions"
+    return PROVIDERS.get(provider, {}).get("url", "")
 
 
 def parse_commands(text):
-    """Extract bash commands from ```bash blocks."""
     commands = []
-    lines = text.split("\n")
     in_block = False
-    current_cmd = []
-    for line in lines:
-        if line.strip().startswith("```bash"):
+    current = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```bash") or stripped.startswith("```sh") or stripped.startswith("```shell"):
             in_block = True
-            current_cmd = []
+            current = []
             continue
-        if line.strip() == "```" and in_block:
-            if current_cmd:
-                commands.append("\n".join(current_cmd))
+        if stripped == "```" and in_block:
+            if current:
+                commands.append("\n".join(current))
             in_block = False
-            current_cmd = []
+            current = []
             continue
         if in_block:
-            current_cmd.append(line)
+            current.append(line)
     return commands
 
 
@@ -112,25 +163,144 @@ def execute_command(cmd, cwd=None, timeout=None):
     timeout = timeout or SHELL_TIMEOUT
     cwd = cwd or CWD
     try:
-        result = subprocess.run(
+        r = subprocess.run(
             cmd, shell=True, capture_output=True, text=True,
-            timeout=timeout, cwd=cwd, env={**os.environ, "TERM": "dumb"}
+            timeout=timeout, cwd=cwd,
+            env={**os.environ, "TERM": "dumb", "COLUMNS": "120"}
         )
-        output = result.stdout
-        if result.stderr:
-            output += f"\n[stderr]\n{result.stderr}" if output else result.stderr
-        if result.returncode != 0:
-            output += f"\n[exit code: {result.returncode}]"
-        return output or "[no output]"
+        out = r.stdout or ""
+        if r.stderr:
+            out += ("\n" if out else "") + r.stderr
+        if r.returncode != 0:
+            out += f"\n[exit code: {r.returncode}]"
+        return out.strip() or "[no output]"
     except subprocess.TimeoutExpired:
-        return f"[timeout: command exceeded {timeout}s]"
+        return f"[timeout after {timeout}s]"
     except Exception as e:
-        return f"[error: {str(e)}]"
+        return f"[error: {e}]"
 
+
+# ── LLM call (streaming) ──────────────────────────────────────────────────
+
+def call_llm_stream(provider, messages, model=""):
+    model = get_model(provider, model)
+    api_key = get_api_key(provider)
+    url = get_provider_url(provider)
+
+    if provider == "ollama":
+        return call_ollama_stream(url, messages, model, api_key)
+    elif provider == "nvidia":
+        return call_openai_compat_stream(url, messages, model, api_key)
+    else:
+        return call_openai_compat_stream(url, messages, model, api_key)
+
+
+def call_openai_compat_stream(url, messages, model, api_key):
+    payload = json.dumps({
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "temperature": 0.2,
+        "max_tokens": 4096,
+    }).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    req = urllib.request.Request(url, data=payload, headers=headers)
+    return urllib.request.urlopen(req, timeout=180)
+
+
+def call_ollama_stream(url, messages, model, api_key):
+    payload = json.dumps({
+        "model": model,
+        "messages": messages,
+        "stream": True,
+    }).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, data=payload, headers=headers)
+    return urllib.request.urlopen(req, timeout=300)
+
+
+def iter_openai_stream(resp):
+    """Yields text tokens from OpenAI-compatible SSE stream."""
+    for raw_line in resp:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+            delta = chunk["choices"][0].get("delta", {})
+            content = delta.get("content", "")
+            if content:
+                yield content
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
+
+
+def iter_ollama_stream(resp):
+    """Yields text tokens from Ollama NDJSON stream."""
+    buf = b""
+    for chunk in resp:
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line.decode("utf-8", errors="replace"))
+                text = obj.get("message", {}).get("content", "")
+                if text:
+                    yield text
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+
+def iter_stream(provider, resp):
+    if provider == "ollama":
+        return iter_ollama_stream(resp)
+    return iter_openai_stream(resp)
+
+
+# ── Ollama model discovery ────────────────────────────────────────────────
+
+def discover_ollama_models():
+    base = OLLAMA_HOST.rstrip("/")
+    url = f"{base}/api/tags"
+    try:
+        req = urllib.request.Request(url)
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read().decode())
+        models = []
+        for m in data.get("models", []):
+            name = m.get("name", "")
+            if name:
+                models.append(name)
+        PROVIDERS["ollama"]["models"] = sorted(models)
+        return models
+    except Exception:
+        return []
+
+
+def discover_ollama_running():
+    base = OLLAMA_HOST.rstrip("/")
+    try:
+        req = urllib.request.Request(f"{base}/api/tags")
+        resp = urllib.request.urlopen(req, timeout=3)
+        return resp.status == 200
+    except Exception:
+        return False
+
+
+# ── HTTP Server ────────────────────────────────────────────────────────────
 
 class AgentHandler(http.server.BaseHTTPRequestHandler):
-    sessions = {}
-
     def log_message(self, format, *args):
         pass
 
@@ -143,37 +313,70 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_OPTIONS(self):
+    def send_cors(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
+    def do_OPTIONS(self):
+        self.send_cors()
+
     def do_GET(self):
-        if self.path == "/" or self.path == "/index.html":
-            self.serve_file("templates/index.html", "text/html")
-        elif self.path.startswith("/static/"):
-            path = self.path[1:]
+        path = self.path.split("?")[0]
+        if path in ("/", "/index.html"):
+            self._serve_file("templates/index.html", "text/html")
+        elif path.startswith("/static/"):
+            ct_map = {"css": "text/css", "js": "text/javascript", "png": "image/png", "svg": "image/svg+xml"}
             ext = path.rsplit(".", 1)[-1] if "." in path else ""
-            ct = {"css": "text/css", "js": "text/javascript", "png": "image/png", "svg": "image/svg+xml"}.get(ext, "application/octet-stream")
-            self.serve_file(path, ct)
-        elif self.path == "/api/health":
-            self.send_json({"status": "ok", "model": OPENAI_MODEL, "platform": sys.platform})
-        elif self.path == "/api/system":
+            self._serve_file(path[1:], ct_map.get(ext, "application/octet-stream"))
+        elif path == "/api/health":
+            self.send_json({
+                "status": "ok",
+                "providers": {
+                    k: {
+                        "name": v["name"],
+                        "key_set": bool(get_api_key(k)),
+                        "models": v["models"][:5],
+                    }
+                    for k, v in PROVIDERS.items()
+                },
+                "ollama_running": discover_ollama_running(),
+            })
+        elif path == "/api/providers":
+            result = {}
+            for k, v in PROVIDERS.items():
+                models = v["models"]
+                if k == "ollama":
+                    models = discover_ollama_models()
+                result[k] = {
+                    "name": v["name"],
+                    "models": models,
+                    "needs_key": v["needs_key"],
+                    "key_set": bool(get_api_key(k)),
+                }
+            self.send_json(result)
+        elif path == "/api/ollama/models":
+            models = discover_ollama_models()
+            self.send_json({"models": models, "host": OLLAMA_HOST})
+        elif path == "/api/system":
             self.send_json({"context": get_system_context()})
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path == "/api/chat":
-            self.handle_chat_stream()
-        elif self.path == "/api/execute":
-            self.handle_execute()
+        path = self.path.split("?")[0]
+        if path == "/api/chat":
+            self._handle_chat()
+        elif path == "/api/execute":
+            self._handle_execute()
+        elif path == "/api/providers":
+            self._handle_set_provider()
         else:
             self.send_error(404)
 
-    def serve_file(self, filepath, content_type):
+    def _serve_file(self, filepath, content_type):
         fpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), filepath)
         try:
             with open(fpath, "rb") as f:
@@ -186,24 +389,43 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
         except FileNotFoundError:
             self.send_error(404)
 
-    def handle_execute(self):
+    def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length)) if length else {}
+        return json.loads(self.rfile.read(length)) if length else {}
+
+    def _handle_execute(self):
+        body = self._read_body()
         cmd = body.get("command", "")
         if not cmd:
             self.send_json({"error": "no command"}, 400)
             return
-        output = execute_command(cmd)
+        output = execute_command(cmd, body.get("cwd"), body.get("timeout"))
         self.send_json({"output": output})
 
-    def handle_chat_stream(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length)) if length else {}
-        messages = body.get("messages", [])
-        auto_execute = body.get("auto_execute", True)
+    def _handle_set_provider(self):
+        body = self._read_body()
+        provider = body.get("provider", DEFAULT_PROVIDER)
+        model = body.get("model", "")
+        if provider not in PROVIDERS:
+            self.send_json({"error": f"unknown provider: {provider}"}, 400)
+            return
+        self.send_json({"provider": provider, "model": model})
 
-        if not OPENAI_API_KEY:
-            self.send_json({"error": "OPENAI_API_KEY not set"}, 400)
+    def _handle_chat(self):
+        body = self._read_body()
+        messages  = body.get("messages", [])
+        provider  = body.get("provider", DEFAULT_PROVIDER)
+        model     = body.get("model", "")
+        auto_exec = body.get("auto_execute", True)
+
+        if provider not in PROVIDERS:
+            self.send_json({"error": f"unknown provider: {provider}"}, 400)
+            return
+
+        key = get_api_key(provider)
+        if PROVIDERS[provider]["needs_key"] and not key:
+            env = PROVIDERS[provider]["env_key"]
+            self.send_json({"error": f"Set {env} environment variable"}, 400)
             return
 
         self.send_response(200)
@@ -214,41 +436,63 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
         sys_ctx = get_system_context()
-        full_messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n--- System Context ---\n" + sys_ctx}] + messages
+        full_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT + "\n\n--- System Context ---\n" + sys_ctx}
+        ] + messages
 
         full_text = ""
+        all_commands = []
+        all_outputs = []
+
         try:
-            resp = call_openai_stream(full_messages)
-            for line in resp:
-                line = line.decode("utf-8", errors="replace").strip()
-                if not line.startswith("data: "):
-                    continue
-                data = line[6:]
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                    delta = chunk["choices"][0].get("delta", {})
-                    content = delta.get("content", "")
-                    if content:
-                        full_text += content
-                        self.send_event("token", content)
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
+            resp = call_llm_stream(provider, full_messages, model)
 
-            self.send_event("done", full_text)
+            for token in iter_stream(provider, resp):
+                full_text += token
+                self._sse("token", token)
 
-            if auto_execute and full_text:
+            self._sse("done", full_text)
+
+            if auto_exec and full_text:
                 cmds = parse_commands(full_text)
                 for cmd in cmds:
-                    self.send_event("executing", cmd)
+                    all_commands.append(cmd)
+                    self._sse("executing", cmd)
                     output = execute_command(cmd)
-                    self.send_event("output", output)
+                    all_outputs.append(output)
+                    self._sse("output", output)
 
+                # Feed results back for summary if there were commands
+                if all_commands:
+                    results_text = ""
+                    for c, o in zip(all_commands, all_outputs):
+                        results_text += f"$ {c}\n{o}\n\n"
+                    follow_up = [
+                        *full_messages,
+                        {"role": "assistant", "content": full_text},
+                        {"role": "user", "content": f"Command results:\n{results_text}\nProvide a brief summary of the output."}
+                    ]
+                    try:
+                        resp2 = call_llm_stream(provider, follow_up, model)
+                        summary = ""
+                        for token in iter_stream(provider, resp2):
+                            summary += token
+                            self._sse("summary_token", token)
+                        self._sse("summary_done", summary)
+                    except Exception:
+                        pass
+
+        except urllib.error.HTTPError as e:
+            err_body = ""
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            self._sse("error", f"API error {e.code}: {err_body[:500]}")
         except urllib.error.URLError as e:
-            self.send_event("error", f"API error: {str(e)}")
+            self._sse("error", f"Connection error: {str(e)}")
         except Exception as e:
-            self.send_event("error", str(e))
+            self._sse("error", str(e))
         finally:
             try:
                 self.wfile.write(b"")
@@ -256,7 +500,7 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def send_event(self, event, data):
+    def _sse(self, event, data):
         payload = json.dumps({"type": event, "data": data})
         msg = f"event: {event}\ndata: {payload}\n\n"
         try:
@@ -266,31 +510,45 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
             pass
 
 
-def main():
-    port = PORT
-    server = http.server.HTTPServer((HOST, port), AgentHandler)
-    print(f"""
-╔══════════════════════════════════════════════╗
-║           ShellAgent v1.0                    ║
-║   AI-Powered Shell Command Agent            ║
-╠══════════════════════════════════════════════╣
-║  Dashboard: http://localhost:{port:<5}           ║
-║  Model:     {OPENAI_MODEL:<31} ║
-║  Platform:  {sys.platform:<31} ║
-╚══════════════════════════════════════════════╝
-""")
-    if not OPENAI_API_KEY:
-        print("⚠  Set OPENAI_API_KEY environment variable to use AI features")
-        print("   Example: export OPENAI_API_KEY='sk-...'\n")
+# ── Main ───────────────────────────────────────────────────────────────────
 
-    def shutdown_handler(sig, frame):
+def main():
+    # Discover Ollama models on startup
+    if discover_ollama_running():
+        discover_ollama_models()
+        ollama_count = len(PROVIDERS["ollama"]["models"])
+        ollama_info = f"✓ {ollama_count} model(s) found"
+    else:
+        ollama_info = "✗ not running"
+
+    print(f"""
+╔═══════════════════════════════════════════════════════╗
+║              ShellAgent v2.0                          ║
+║      AI Shell Agent — Multi-Provider                  ║
+╠═══════════════════════════════════════════════════════╣
+║  Dashboard : http://localhost:{PORT:<25}║
+║  Platform  : {sys.platform:<40}║
+╠═══════════════════════════════════════════════════════╣
+║  Providers                                           ║
+║  ├─ OpenAI   : {"✓ key set" if OPENAI_API_KEY else "✗ no key":<40}║
+║  ├─ NVIDIA   : {"✓ key set" if NVIDIA_API_KEY else "✗ no key":<40}║
+║  └─ Ollama   : {ollama_info:<40}║
+╚═══════════════════════════════════════════════════════╝
+""")
+    if not any([OPENAI_API_KEY, NVIDIA_API_KEY, OLLAMA_HOST]):
+        print("⚠  Set at least one provider key. Examples:")
+        print("   export OPENAI_API_KEY='sk-...'")
+        print("   export NVIDIA_API_KEY='nvapi-...'")
+        print("   export OLLAMA_HOST='http://localhost:11434'\n")
+
+    def shutdown(sig, frame):
         print("\nShutting down...")
-        server.shutdown()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
 
+    server = http.server.HTTPServer((HOST, PORT), AgentHandler)
     server.serve_forever()
 
 

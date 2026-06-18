@@ -1,8 +1,10 @@
 #!/bin/bash
 set -e
-echo "╔════════════════════════════════════════╗"
-echo "║      ShellAgent - Quick Setup          ║"
-echo "╚════════════════════════════════════════╝"
+echo ""
+echo "╔════════════════════════════════════════════════╗"
+echo "║      ShellAgent v2.0 — Quick Setup            ║"
+echo "╚════════════════════════════════════════════════╝"
+echo ""
 
 PYTHON=""
 for cmd in python3 python; do
@@ -13,26 +15,34 @@ for cmd in python3 python; do
 done
 
 if [ -z "$PYTHON" ]; then
-  echo "❌ Python 3.8+ is required. Please install Python first."
+  echo "❌ Python 3.8+ is required."
   exit 1
 fi
 
 PY_VER=$($PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-echo "✓ Found Python $PY_VER at $(which $PYTHON)"
-
-# Check for 32-bit support
 ARCH=$(uname -m)
+echo "✓ Python $PY_VER ($(which $PYTHON))"
 echo "✓ Architecture: $ARCH"
+echo ""
 
-if [ -z "$OPENAI_API_KEY" ]; then
-  echo ""
-  echo "⚠  No OPENAI_API_KEY found in environment."
-  echo "   Set it with: export OPENAI_API_KEY='sk-...'"
-  echo ""
+# Provider status
+[ -n "$OPENAI_API_KEY" ] && echo "✓ OpenAI: key set" || echo "  OpenAI: set OPENAI_API_KEY"
+[ -n "$NVIDIA_API_KEY" ] && echo "✓ NVIDIA: key set" || echo "  NVIDIA: set NVIDIA_API_KEY"
+
+if command -v curl &>/dev/null; then
+  if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+    echo "✓ Ollama: running locally"
+  else
+    echo "  Ollama: not detected (install from ollama.ai)"
+  fi
+else
+  echo "  Ollama: can't check (curl not found)"
 fi
 
 echo ""
-echo "Starting ShellAgent on http://localhost:8765"
-echo "Press Ctrl+C to stop"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Starting ShellAgent on http://localhost:8765"
+echo "  Press Ctrl+C to stop"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 exec $PYTHON app.py
