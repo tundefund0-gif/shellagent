@@ -1,4 +1,4 @@
-/* ─── ShellAgent v7.1 Frontend ─────────────────────────────────────── */
+/* ─── ShellAgent v7.2 Frontend ─────────────────────────────────────── */
 
 let chatHistory = [];
 let isStreaming = false;
@@ -11,6 +11,7 @@ let sessions = [];
 let totalTokens = 0;
 let sessionId = crypto.randomUUID ? crypto.randomUUID().slice(0, 16) : Math.random().toString(36).slice(2, 16);
 let userScrolledUp = false;
+let scrollEnabled = true;
 
 const chatArea = document.getElementById('chatArea');
 const messagesEl = document.getElementById('messages');
@@ -23,6 +24,12 @@ const iterBadge = document.getElementById('iterBadge');
 const iterText = document.getElementById('iterText');
 const tokenBadge = document.getElementById('tokenBadge');
 const tokenText = document.getElementById('tokenText');
+const convPanel = document.getElementById('convPanel');
+const convOverlay = document.getElementById('convOverlay');
+const convList = document.getElementById('convList');
+const convSearch = document.getElementById('convSearch');
+const convBtn = document.getElementById('convBtn');
+const scrollBtn = document.getElementById('scrollBtn');
 
 const TOOL_META = {
   execute_shell_command: { icon: '\u26a1', label: 'Shell', color: 'var(--green)' },
@@ -40,6 +47,11 @@ const TOOL_META = {
 };
 function getToolMeta(n) { return TOOL_META[n] || { icon: '\ud83d\udd27', label: n, color: 'var(--text2)' }; }
 
+function now() {
+  var d = new Date();
+  return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+}
+
 function init() {
   Promise.all([
     fetch('/api/providers'),
@@ -51,11 +63,10 @@ function init() {
     providerModels = arr[0];
     var cwdData = arr[1];
     if (cwdData.cwd) document.getElementById('cwdDisplay').textContent = cwdData.cwd;
-    if (arr[2]) { sessions = arr[2].sessions || []; renderSessions(); }
+    if (arr[2]) { sessions = arr[2].sessions || []; renderConvPanel(); }
     for (var pid in providerModels) {
       if (providerModels[pid].models.length > 0) {
         currentProvider = pid;
-        // Skip __custom__ as default, find first real model
         for (var mi = 0; mi < providerModels[pid].models.length; mi++) {
           if (providerModels[pid].models[mi] !== '__custom__') {
             currentModel = providerModels[pid].models[mi];
@@ -70,13 +81,90 @@ function init() {
   }).catch(function(e) { console.error('Init failed:', e); });
   userInput.focus();
   loadHistory();
+  refreshSessions();
 }
 
+// ─── Conversations Panel ─────────────────────────────────────────────
+function toggleConvPanel() {
+  var isOpen = convPanel.classList.contains('open');
+  convPanel.classList.toggle('open');
+  convOverlay.classList.toggle('show');
+  if (!isOpen) renderConvPanel();
+}
+
+function renderConvPanel() {
+  var q = (convSearch.value || '').toLowerCase();
+  var filtered = sessions.filter(function(s) {
+    var preview = (s.preview || '').toLowerCase();
+    var id = (s.id || '').toLowerCase();
+    return preview.indexOf(q) !== -1 || id.indexOf(q) !== -1;
+  });
+  if (!filtered.length) {
+    convList.innerHTML = '<div class="conv-empty">' + (q ? 'No matching conversations' : 'No conversations yet') + '</div>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < filtered.length; i++) {
+    var s = filtered[i];
+    var age = Math.floor((Date.now() / 1000 - s.created_at) / 60);
+    var ageStr = age < 1 ? 'just now' : age < 60 ? age + 'm ago' : Math.floor(age / 60) + 'h ago';
+    var preview = s.preview || '(empty)';
+    html += '<div class="conv-card" onclick="loadConvSession(\'' + s.id + '\')">' +
+      '<button class="conv-card-del" onclick="event.stopPropagation();deleteConvSession(\'' + s.id + '\')" title="Delete">\u2716</button>' +
+      '<div class="conv-card-preview">' + h(preview) + '</div>' +
+      '<div class="conv-card-meta"><span class="conv-card-msgs">' + s.messages + ' msgs</span><span class="conv-card-time">' + ageStr + '</span></div>' +
+      '</div>';
+  }
+  convList.innerHTML = html;
+}
+
+function loadConvSession(sid) {
+  fetch('/api/sessions/load', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sid }),
+  }).then(function(resp) { return resp.json(); }).then(function(data) {
+    if (data.session && data.session.messages) {
+      messagesEl.innerHTML = '';
+      welcomeEl.style.display = 'none';
+      for (var i = 0; i < data.session.messages.length; i++) {
+        var m = data.session.messages[i];
+        if (m.role === 'user' || m.role === 'assistant') addMsg(m.role, m.content, false, m.timestamp);
+      }
+      sessionId = sid;
+      chatHistory = data.session.messages.slice(-100) || [];
+      addSystemMsg('Loaded session ' + sid.slice(0, 8));
+    }
+  }).catch(function(e) { addSystemMsg('Failed to load session: ' + e.message); });
+  toggleConvPanel();
+}
+
+function deleteConvSession(sid) {
+  fetch('/api/sessions/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sid }),
+  }).then(function(resp) { return resp.json(); }).then(function(data) {
+    if (data.ok) {
+      sessions = sessions.filter(function(s) { return s.id !== sid; });
+      renderConvPanel();
+    }
+  }).catch(function() {});
+}
+
+function refreshSessions() {
+  fetch('/api/sessions').then(function(r) { return r.json(); }).then(function(data) {
+    sessions = data.sessions || [];
+    renderConvPanel();
+    renderSessions();
+  }).catch(function() {});
+}
+
+// ─── Provider ─────────────────────────────────────────────────────────
 function setProvider(pid) {
   if (!providerModels[pid]) return;
   currentProvider = pid;
   currentModel = '';
-  // Find first real model (skip __custom__)
   for (var mi = 0; mi < providerModels[pid].models.length; mi++) {
     if (providerModels[pid].models[mi] !== '__custom__') {
       currentModel = providerModels[pid].models[mi];
@@ -108,7 +196,6 @@ function toggleModelDropdown() {
     for (var i = 0; i < info.models.length; i++) {
       var m = info.models[i];
       if (m === '__custom__') {
-        // Show "Custom model..." option
         var sel = currentModel !== '' && currentModel !== '__custom__' && pid === currentProvider && info.models.indexOf(currentModel) === -1 ? ' selected' : '';
         html += '<div class="dd-item' + sel + '" onclick="showCustomModelInput(\'' + pid + '\')"><span class="dd-dot ' + pid + '"></span>\u270f Custom model...</div>';
         continue;
@@ -122,18 +209,16 @@ function toggleModelDropdown() {
 }
 
 function pickModel(pid, model) { currentProvider = pid; currentModel = model; modelDropdown.classList.remove('show'); document.getElementById('customModelInputWrap').style.display = 'none'; updateProviderUI(); }
-
 function showCustomModelInput(pid) {
   modelDropdown.classList.remove('show');
   currentProvider = pid;
   currentModel = '';
   document.getElementById('customModelInputWrap').style.display = 'flex';
   document.getElementById('customModelInput').value = '';
-  document.getElementById('customModelInput').placeholder = 'Enter model name (e.g. meta/llama-3.3-70b-instruct)';
+  document.getElementById('customModelInput').placeholder = 'Enter model name...';
   document.getElementById('customModelInput').focus();
   updateProviderUI();
 }
-
 function applyCustomModel(pid) {
   var input = document.getElementById('customModelInput');
   var model = input.value.trim();
@@ -142,7 +227,6 @@ function applyCustomModel(pid) {
   currentModel = model;
   document.getElementById('customModelInputWrap').style.display = 'none';
   updateProviderUI();
-  // Notify server to add this model
   fetch('/api/custom_model', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -154,6 +238,7 @@ document.addEventListener('click', function(e) {
   if (!e.target.closest('.model-selector') && !e.target.closest('.model-dropdown')) modelDropdown.classList.remove('show');
 });
 
+// ─── CWD ─────────────────────────────────────────────────────────────
 function toggleCwdEdit() {
   var btn = document.getElementById('cwdBtn');
   var wrap = document.getElementById('cwdInputWrap');
@@ -167,7 +252,6 @@ function toggleCwdEdit() {
     btn.style.display = 'flex';
   }
 }
-
 function changeCwd() {
   var val = document.getElementById('cwdInput').value.trim();
   if (!val) return;
@@ -190,6 +274,7 @@ function changeCwd() {
 function esc(s) { return s.replace(/'/g, "\\'").replace(/\\/g, "\\\\"); }
 function h(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
+// ─── Markdown renderer ────────────────────────────────────────────────
 function renderMd(text) {
   if (!text) return '';
   var s = h(text);
@@ -216,16 +301,61 @@ function copyCode(btn) {
     setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
   });
 }
-
 function copyText(text) { navigator.clipboard.writeText(text).catch(function() {}); }
 
-function addMsg(role, content, streaming) {
+// ─── Input actions ───────────────────────────────────────────────────
+function toggleScroll() {
+  scrollEnabled = !scrollEnabled;
+  userScrolledUp = !scrollEnabled;
+  scrollBtn.classList.toggle('active', !scrollEnabled);
+  if (scrollEnabled) scroll();
+}
+
+function clearChat() {
+  if (messagesEl.children.length === 0 || welcomeEl.style.display !== 'none') return;
+  if (!confirm('Clear this conversation? This cannot be undone.')) return;
+  messagesEl.innerHTML = '';
+  chatHistory = [];
+  commandHistory = [];
+  currentPlan = [];
+  welcomeEl.style.display = 'flex';
+  renderPlan();
+  renderHistory();
+  fetch('/api/sessions/clear', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId }),
+  }).catch(function() {});
+}
+
+function copyChat() {
+  var parts = [];
+  var nodes = messagesEl.querySelectorAll('.msg');
+  for (var i = 0; i < nodes.length; i++) {
+    var nameEl = nodes[i].querySelector('.msg-name');
+    var contentEl = nodes[i].querySelector('.msg-content');
+    if (nameEl && contentEl) {
+      parts.push(nameEl.textContent.replace(/\uD83D\uDCCB.*$/, '').trim() + ': ' + contentEl.textContent.trim());
+    }
+  }
+  if (parts.length) {
+    navigator.clipboard.writeText(parts.join('\n\n')).then(function() {
+      addSystemMsg('Conversation copied to clipboard');
+    }).catch(function() {});
+  }
+}
+
+// ─── Messages ─────────────────────────────────────────────────────────
+function addMsg(role, content, streaming, timestamp) {
   if (welcomeEl) welcomeEl.style.display = 'none';
   var div = document.createElement('div');
   div.className = 'msg msg-' + role;
   var name = role === 'user' ? 'You' : 'ShellAgent';
   var icon = role === 'user' ? '\ud83d\udc64' : '\u26a1';
-  div.innerHTML = '<div class="msg-head"><span class="msg-icon">' + icon + '</span><span class="msg-name">' + name + (streaming ? ' <span class="typing-dot">...</span>' : '') + '<button class="copy-msg-btn" onclick="copyText(this.closest(\'.msg\').querySelector(\'.msg-content\').textContent)" title="Copy message" aria-label="Copy message">\ud83d\udccb</button></span></div><div class="msg-content">' + (content ? renderMd(content) : '') + '</div>';
+  var ts = timestamp ? (typeof timestamp === 'number' ? timestamp : Date.now() / 1000) : Date.now() / 1000;
+  var d = new Date(ts * 1000);
+  var tsStr = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+  div.innerHTML = '<div class="msg-head"><span class="msg-icon">' + icon + '</span><span class="msg-name">' + name + (streaming ? ' <span class="typing-dot">...</span>' : '') + '<span class="msg-time">' + tsStr + '</span><button class="copy-msg-btn" onclick="copyText(this.closest(\'.msg\').querySelector(\'.msg-content\').textContent)" title="Copy message" aria-label="Copy message">\ud83d\udccb</button></span></div><div class="msg-content">' + (content ? renderMd(content) : '') + '</div>';
   messagesEl.appendChild(div);
   scroll();
   return div;
@@ -255,6 +385,7 @@ function addIterSep(n) {
   messagesEl.appendChild(div);
 }
 
+// ─── Tool calls ───────────────────────────────────────────────────────
 function addToolCall(id, name, args) {
   var meta = getToolMeta(name);
   var div = document.createElement('div');
@@ -302,6 +433,7 @@ function updateToolResult(id, output, success, exitCode, name) {
   }
 }
 
+// ─── Plan ─────────────────────────────────────────────────────────────
 function renderPlan() {
   var list = document.getElementById('planList');
   var count = document.getElementById('planCount');
@@ -316,6 +448,7 @@ function renderPlan() {
   list.innerHTML = html;
 }
 
+// ─── History ──────────────────────────────────────────────────────────
 function renderHistory() {
   var list = document.getElementById('historyList');
   if (!commandHistory.length) { list.innerHTML = '<div class="plan-empty">No commands yet</div>'; return; }
@@ -330,44 +463,32 @@ function renderHistory() {
   list.innerHTML = html;
 }
 
+// ─── Sessions sidebar ────────────────────────────────────────────────
 function renderSessions() {
   var list = document.getElementById('sessionsList');
   if (!sessions.length) { list.innerHTML = '<div class="plan-empty">No sessions</div>'; return; }
   var html = '';
-  for (var i = 0; i < sessions.length; i++) {
+  for (var i = 0; i < Math.min(sessions.length, 15); i++) {
     var s = sessions[i];
     var age = Math.floor((Date.now() / 1000 - s.created_at) / 60);
     var ageStr = age < 60 ? age + 'm' : Math.floor(age / 60) + 'h';
-    html += '<div class="history-item" onclick="loadSession(\'' + s.id + '\')" style="cursor:pointer"><span class="tool-icon">\ud83d\udcdd</span><span class="history-text">' + s.id.slice(0, 8) + '\u2026 (' + s.messages + ' msgs, ' + ageStr + ' ago)</span></div>';
+    var preview = s.preview ? s.preview.slice(0, 25) : s.id.slice(0, 8) + '\u2026';
+    html += '<div class="history-item" onclick="loadConvSession(\'' + s.id + '\')" style="cursor:pointer"><span class="tool-icon">\ud83d\udcdd</span><span class="history-text">' + h(preview) + ' (' + s.messages + ' msgs)</span></div>';
   }
   list.innerHTML = html;
 }
 
-function loadSession(sid) {
-  fetch('/api/sessions/load', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ session_id: sid }),
-  }).then(function(resp) { return resp.json(); }).then(function(data) {
-    if (data.session && data.session.messages) {
-      messagesEl.innerHTML = '';
-      for (var i = 0; i < data.session.messages.length; i++) {
-        var m = data.session.messages[i];
-        if (m.role === 'user' || m.role === 'assistant') addMsg(m.role, m.content);
-      }
-      addSystemMsg('Loaded session ' + sid.slice(0, 8));
-    }
-  }).catch(function(e) { addSystemMsg('Failed to load session: ' + e.message); });
-}
-
+// ─── Scroll ───────────────────────────────────────────────────────────
 function scroll() {
-  if (!userScrolledUp) chatArea.scrollTop = chatArea.scrollHeight;
+  if (scrollEnabled && !userScrolledUp) chatArea.scrollTop = chatArea.scrollHeight;
 }
 chatArea.addEventListener('scroll', function() {
   var atBottom = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < 100;
   userScrolledUp = !atBottom;
+  if (atBottom && !scrollEnabled) { scrollEnabled = true; scrollBtn.classList.remove('active'); }
 });
 
+// ─── Loading ──────────────────────────────────────────────────────────
 function showLoading() {
   var div = document.createElement('div');
   div.className = 'loading-dots';
@@ -381,6 +502,7 @@ function hideLoading() {
   if (el) el.remove();
 }
 
+// ─── Send message ─────────────────────────────────────────────────────
 function sendMessage() {
   var text = userInput.value.trim();
   if (!text || isStreaming) return;
@@ -419,7 +541,6 @@ function sendMessage() {
     function processStream(result) {
       if (result.done) {
         if (agentDiv && !gotContent) {
-          // Show error instead of blank message
           hideLoading();
           agentDiv.remove();
           addSystemMsg('AI returned no response. Check your API key and model are correct.', true);
@@ -435,7 +556,7 @@ function sendMessage() {
         iterBadge.style.display = 'none';
         scroll();
         userInput.focus();
-        fetch('/api/sessions').then(function(r) { return r.json(); }).then(function(sd) { sessions = sd.sessions || []; renderSessions(); }).catch(function() {});
+        refreshSessions();
         return;
       }
       buf += decoder.decode(result.value, { stream: true });
@@ -471,8 +592,6 @@ function sendMessage() {
                 if (!agentDiv) { hideLoading(); agentDiv = addMsg('assistant', p.data); }
                 else contentEl.innerHTML = renderMd(p.data);
                 chatHistory.push({ role: 'assistant', content: p.data });
-              } else if (!gotContent) {
-                // Empty done — will handle in processStream finish
               }
               break;
             case 'tool_call':
@@ -536,6 +655,7 @@ document.addEventListener('keydown', function(e) {
   if (e.key === '/' && document.activeElement !== userInput) { e.preventDefault(); userInput.focus(); }
   if (e.key === 'Escape') {
     modelDropdown.classList.remove('show');
+    if (convPanel.classList.contains('open')) toggleConvPanel();
     var cwdWrap = document.getElementById('cwdInputWrap');
     if (cwdWrap && cwdWrap.style.display !== 'none') toggleCwdEdit();
     var cmWrap = document.getElementById('customModelInputWrap');
@@ -555,7 +675,6 @@ function loadHistory() {
     renderHistory();
   } catch (e) {}
 }
-
 function saveHistory() {
   try { localStorage.setItem('shellagent_history', JSON.stringify(commandHistory.slice(-100))); } catch (e) {}
 }

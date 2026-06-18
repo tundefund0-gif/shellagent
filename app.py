@@ -23,7 +23,7 @@ logging.basicConfig(
 log = logging.getLogger("shellagent")
 
 # ── Configuration ──────────────────────────────────────────────────────────
-VERSION = "7.1"
+VERSION = "7.2"
 PORT            = int(os.environ.get("SHELLAGENT_PORT", "8765"))
 HOST            = os.environ.get("SHELLAGENT_HOST", "0.0.0.0")
 CWD             = os.environ.get("SHELLAGENT_CWD", os.getcwd())
@@ -145,6 +145,52 @@ class SessionStore:
             return data
         except Exception:
             return None
+
+    def delete_session(self, session_id):
+        """Delete a session from memory and disk."""
+        with self._lock:
+            self._sessions.pop(session_id, None)
+        try:
+            fpath = os.path.join(SESSION_DIR, f"{session_id}.json")
+            if os.path.isfile(fpath):
+                os.remove(fpath)
+        except Exception:
+            pass
+        return True
+
+    def clear_messages(self, session_id):
+        """Clear all messages in a session but keep the session."""
+        with self._lock:
+            if session_id in self._sessions:
+                self._sessions[session_id]["messages"] = []
+                self._sessions[session_id]["plan"] = []
+        return True
+
+    def get_session(self, session_id):
+        """Get full session data."""
+        with self._lock:
+            s = self._sessions.get(session_id)
+            if s:
+                return dict(s)
+            return None
+
+    def list_sessions_with_preview(self):
+        """List sessions with a preview of the first user message."""
+        with self._lock:
+            result = []
+            for s in sorted(self._sessions.values(), key=lambda x: x["created_at"], reverse=True)[:50]:
+                preview = ""
+                for m in s.get("messages", []):
+                    if m.get("role") == "user":
+                        preview = m.get("content", "")[:80]
+                        break
+                result.append({
+                    "id": s["id"],
+                    "messages": len(s["messages"]),
+                    "created_at": s["created_at"],
+                    "preview": preview,
+                })
+            return result
 
 sessions = SessionStore()
 
@@ -1218,7 +1264,7 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/cwd":
             self._json_response({"cwd": CWD})
         elif path == "/api/sessions":
-            self._json_response({"sessions": sessions.list_sessions()})
+            self._json_response({"sessions": sessions.list_sessions_with_preview()})
         elif path == "/api/audit":
             self._json_response({"entries": audit.recent(50)})
         elif path.startswith("/static/"):
@@ -1236,6 +1282,10 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
             self._handle_load_session()
         elif path == "/api/custom_model":
             self._handle_custom_model()
+        elif path == "/api/sessions/delete":
+            self._handle_delete_session()
+        elif path == "/api/sessions/clear":
+            self._handle_clear_session()
         else:
             self.send_error(404)
 
@@ -1304,10 +1354,41 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
             if provider not in PROVIDERS:
                 self._json_response({"error": "Unknown provider"}, 400)
                 return
-            # Add custom model to the front of the provider's model list (in memory only)
             if model not in PROVIDERS[provider].get("models", []):
                 PROVIDERS[provider]["models"].insert(0, model)
             self._json_response({"ok": True, "provider": provider, "model": model})
+        except Exception as e:
+            self._json_response({"error": str(e)}, 500)
+
+    def _handle_delete_session(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 10000:
+                self._json_response({"error": "Request too large"}, 413)
+                return
+            body = json.loads(self.rfile.read(length))
+            session_id = body.get("session_id", "")
+            if not session_id:
+                self._json_response({"error": "Missing session_id"}, 400)
+                return
+            sessions.delete_session(session_id)
+            self._json_response({"ok": True})
+        except Exception as e:
+            self._json_response({"error": str(e)}, 500)
+
+    def _handle_clear_session(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 10000:
+                self._json_response({"error": "Request too large"}, 413)
+                return
+            body = json.loads(self.rfile.read(length))
+            session_id = body.get("session_id", "")
+            if not session_id:
+                self._json_response({"error": "Missing session_id"}, 400)
+                return
+            sessions.clear_messages(session_id)
+            self._json_response({"ok": True})
         except Exception as e:
             self._json_response({"error": str(e)}, 500)
 
