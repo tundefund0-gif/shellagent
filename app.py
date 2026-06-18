@@ -72,6 +72,10 @@ def _track_process(session_id, proc):
     with _procs_lock:
         old = _running_procs.get(session_id)
         if old:
+            try:
+                import os as _os3
+                _os3.killpg(_os3.getpgid(old.pid), 15)
+            except: pass
             try: old.kill()
             except: pass
         _running_procs[session_id] = proc
@@ -84,7 +88,15 @@ def _kill_process(session_id):
     with _procs_lock:
         p = _running_procs.pop(session_id, None)
         if p:
-            try: p.kill(); return True
+            try:
+                import os as _os3
+                pgid = _os3.getpgid(p.pid)
+                _os3.killpg(pgid, 15)
+                return True
+            except: pass
+            try:
+                p.kill()
+                return True
             except: pass
     return False
 
@@ -633,12 +645,51 @@ def execute_shell_command(command, working_directory=None, session_id=None):
                     pass
             safe_output = "[safely killed %d process(es) matching '%s']" % (killed, pat)
             return {"output": safe_output, "success": True, "exit_code": 0, "retries": 0}
+    # ── Server/daemon auto-detection ──
+    # If the command starts a long-lived server, background it and return immediately
+    _server_patterns = [
+        "python3 -m http.server", "python -m http.server",
+        "flask run", "uvicorn", "gunicorn", "waitress-serve",
+        "node server", "npm start", "npm run", "yarn start",
+        "ng serve", "react-scripts start", "vite",
+        "http-server", "serve ", "live-server",
+        "docker compose up", "docker-compose up",
+        "tail -f", "watch ", "inotifywait",
+    ]
+    cmd_lower = command.strip().lower()
+    is_server = any(cmd_lower.startswith(p.lower()) or cmd_lower.startswith("nohup " + p.lower()) for p in _server_patterns)
+    
+    # Also detect background operators
+    if command.strip().endswith("&"):
+        is_server = True
+    
+    if is_server and session_id:
+        log.info("Detected server command, backgrounding: %s", command[:100])
+        proc = subprocess.Popen(
+            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=cwd, start_new_session=True,
+            env={**os.environ, "TERM": "dumb", "COLUMNS": "120"},
+        )
+        _track_process(session_id, proc)
+        out = "[PID %d] Server started in background: %s\n" % (proc.pid, command)
+        out += "Use the kill button or send a message to stop it."
+        return {"output": out, "success": True, "exit_code": 0, "retries": 0, "pid": proc.pid}
+    
+    elif is_server and not session_id:
+        # Fallback: use Popen without tracking
+        proc = subprocess.Popen(
+            command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=cwd, start_new_session=True,
+            env={**os.environ, "TERM": "dumb", "COLUMNS": "120"},
+        )
+        return {"output": "[PID %d] Server started in background: %s" % (proc.pid, command), "success": True, "exit_code": 0, "retries": 0, "pid": proc.pid}
+
     for attempt in range(MAX_RETRIES):
         try:
             if session_id:
                 proc = subprocess.Popen(
                     command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, cwd=cwd,
+                    text=True, cwd=cwd, start_new_session=True,
                     env={**os.environ, "TERM": "dumb", "COLUMNS": "120"},
                 )
                 _track_process(session_id, proc)
@@ -646,7 +697,12 @@ def execute_shell_command(command, working_directory=None, session_id=None):
                     stdout, stderr = proc.communicate(timeout=CMD_TIMEOUT)
                     r = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    try:
+                        import os as _os4
+                        _os4.killpg(_os4.getpgid(proc.pid), 9)
+                    except: pass
+                    try: proc.kill()
+                    except: pass
                     _untrack_process(session_id)
                     return {"output": "[timeout after %ds]" % CMD_TIMEOUT, "success": False, "exit_code": -1, "retries": retries}
                 _untrack_process(session_id)
